@@ -216,3 +216,36 @@ def bf16_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
+
+
+def bf16_mega_moe_backward(dx: torch.Tensor,
+                           dw1_weights: torch.Tensor,
+                           dw2_weights: torch.Tensor,
+                           dtopk_weights: torch.Tensor,
+                           dy: torch.Tensor,
+                           l1_weights: torch.Tensor,
+                           l2_weights: torch.Tensor,
+                           sym_buffer: SymmBuffer,
+                           shared_l1_weights: Optional[torch.Tensor] = None,
+                           shared_l2_weights: Optional[torch.Tensor] = None,
+                           shared_dw1_weights: Optional[torch.Tensor] = None,
+                           shared_dw2_weights: Optional[torch.Tensor] = None,
+                           activation: str = 'swiglu',
+                           activation_clamp: Optional[float] = None,
+                           fast_math: bool = True):
+    _C.bf16_mega_moe_backward(
+        dx,
+        dw1_weights, dw2_weights, dtopk_weights,
+        dy,
+        l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
+        shared_dw1_weights, shared_dw2_weights,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts,
+        sym_buffer.num_topk,
+        activation, activation_clamp,
+        fast_math
+    )
