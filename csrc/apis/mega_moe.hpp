@@ -84,6 +84,11 @@ get_symm_buffer_size_for_mega_moe(
         num_shared_experts
     );
 
+    const auto mega_backward_buffer = layout::MegaMoEBackwardBuffer(
+        mega_buffer.get_end_ptr(), hidden, num_max_tokens_per_rank, num_topk, num_shared_experts,
+        mega_buffer.workspace.num_max_pool_tokens
+    );
+
     // Check SF buffer requirements
     if (with_sf) {
         DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
@@ -149,7 +154,7 @@ get_symm_buffer_size_for_mega_moe(
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
                                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
-    return {mega_buffer.get_num_bytes(), slice_input_buffers};
+    return {mega_buffer.get_num_bytes() + mega_backward_buffer.get_num_bytes(), slice_input_buffers};
 }
 
 static void fp8_fp4_mega_moe(
@@ -490,23 +495,41 @@ static void bf16_mega_moe_backward(
     const auto [x, _x_sf, topk_idx, topk_weights,
                 shared_l1_acts, _shared_l1_acts_sf, shared_l2_acts, _shared_l2_acts_sf,
                 l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf] = slice(sym_buffer);
+    const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
+    const auto mega_buffer = layout::MegaMoEBuffer(
+        nullptr, hidden, intermediate_hidden,
+        num_ranks, num_experts, num_max_tokens_per_rank,
+        num_topk, num_ring_tokens, 0, false,
+        num_shared_experts
+    );
+    const auto bwd_buffer = layout::MegaMoEBackwardBuffer(
+        mega_buffer.get_end_ptr(), hidden, num_max_tokens_per_rank, num_topk, num_shared_experts,
+        mega_buffer.workspace.num_max_pool_tokens
+    );
+    auto dy_view = torch::from_blob(
+        math::advance_ptr(sym_buffer.data_ptr(), reinterpret_cast<int64_t>(bwd_buffer.input_dy_buffer.base)),
+        {num_max_tokens_per_rank, hidden},
+        torch::TensorOptions().dtype(torch::kBFloat16).device(sym_buffer.device()));
+    dy_view.narrow(0, 0, num_tokens).copy_(dy);
+
+    const torch::Tensor* shared_l1_weights_ptr = shared_l1_weights_opt.has_value() ? &shared_l1_weights : nullptr;
+    const torch::Tensor* shared_l2_weights_ptr = shared_l2_weights_opt.has_value() ? &shared_l2_weights : nullptr;
+    torch::Tensor* shared_dw1_weights_ptr = shared_dw1_weights_opt.has_value() ? &shared_dw1_weights : nullptr;
+    torch::Tensor* shared_dw2_weights_ptr = shared_dw2_weights_opt.has_value() ? &shared_dw2_weights : nullptr;
 
     if (arch_major == 10) {
         sm100_bf16_mega_moe_backward(dx,
                                      dw1_weights, dw2_weights, dtopk_weights,
-                                     dy,
-                                     l1_acts, l2_acts,
-                                     shared_l1_acts, shared_l2_acts,
                                      l1_weights, l2_weights,
-                                     shared_l1_weights, shared_l2_weights,
-                                     shared_dw1_weights, shared_dw2_weights,
-                                     topk_idx, topk_weights,
+                                     shared_l1_weights_ptr, shared_l2_weights_ptr,
+                                     shared_dw1_weights_ptr, shared_dw2_weights_ptr,
                                      sym_buffer_ptrs,
                                      rank_idx, num_max_tokens_per_rank,
                                      num_experts_per_rank,
                                      num_shared_experts,
                                      num_tokens, num_topk,
                                      hidden, intermediate_hidden,
+                                     num_ring_tokens,
                                      activation_clamp, fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");

@@ -453,6 +453,43 @@ struct MegaMoEBuffer {
         return static_cast<uint8_t*>(combine_token_buffer.get_end_ptr())
                - reinterpret_cast<uint8_t*>(workspace.signals);
     }
+
+    CUTLASS_HOST_DEVICE
+    void* get_end_ptr() const {
+        return combine_token_buffer.get_end_ptr();
+    }
+};
+
+struct MegaMoEBackwardBuffer {
+    struct alignas(16) BlockDesc {
+        uint32_t local_expert;
+        uint32_t pool_begin;
+        uint32_t valid_m;
+    };
+    Buffer input_dy_buffer;
+    Buffer dx_slot_buffer;
+    Buffer dtopk_weight_slot_buffer;
+    BlockDesc* block_desc;
+    uint32_t max_num_blocks;
+    uint32_t* next_block;
+    uint32_t* num_blocks;
+    MegaMoEBackwardBuffer() = default;
+    CUTLASS_HOST_DEVICE MegaMoEBackwardBuffer(void* base, const uint32_t& hidden, const uint32_t& num_max_tokens_per_rank, const uint32_t& num_topk, const uint32_t& num_shared_experts, const uint32_t& num_max_pool_tokens) {
+        const auto bf16_token_layout = layout::Data(hidden * 2);
+        input_dy_buffer = Buffer(bf16_token_layout, 1, num_max_tokens_per_rank, base);
+        dx_slot_buffer = Buffer(
+            bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
+            input_dy_buffer.get_end_ptr());
+        dtopk_weight_slot_buffer = Buffer(layout::Data(sizeof(float), false), num_topk, num_max_tokens_per_rank,dx_slot_buffer.get_end_ptr());
+        max_num_blocks = math::ceil_div<uint32_t>(num_max_pool_tokens, kMinCandidateBlockM) + math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM) + 1;
+        block_desc = reinterpret_cast<BlockDesc*>(dtopk_weight_slot_buffer.get_end_ptr());
+        next_block = reinterpret_cast<uint32_t*>(block_desc + max_num_blocks);
+        num_blocks = next_block + 1;
+    }
+    [[nodiscard]] CUTLASS_HOST_DEVICE void* get_end_ptr() const { return num_blocks+1; }
+    [[nodiscard]] CUTLASS_HOST_DEVICE int64_t get_num_bytes() const {
+        return static_cast<uint8_t*>(get_end_ptr()) - static_cast<uint8_t*>(input_dy_buffer.base);
+    }
 };
 
 } // namespace deep_gemm::layout
