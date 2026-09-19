@@ -9,34 +9,29 @@
 
 namespace deep_gemm {
 
-
 struct MegaMoEBackwardConfig {
     int block_m;
     int num_threads;
+    int num_stages;
     int smem_size;
 
     friend std::ostream& operator << (std::ostream& os, const MegaMoEBackwardConfig& config) {
         os << "MegaMoEBackwardConfig("
            << "block_m=" << config.block_m
            << ", num_threads=" << config.num_threads
+           << ", num_stages=" << config.num_stages
            << ", smem_size=" << config.smem_size << ")";
         return os;
     }
 };
 
-static int get_mega_moe_backward_smem_size(const int& block_m, const int& hidden, const int& intermediate_hidden) {
-    constexpr int kAlign = 1024;
-    const auto AL = [&](const int& n) { return math::align(n, kAlign); };
-    const int smem_size =
-        AL(2*block_m*hidden*2) +
-        AL(2*block_m*hidden*2) +
-        AL(block_m*2*intermediate_hidden*4) +
-        AL(block_m*intermediate_hidden*4) +
-        AL(block_m*intermediate_hidden*4) +
-        AL(block_m*2*intermediate_hidden*4) +
-        AL(block_m*hidden*4) +
-        8192;
-    return smem_size;
+static constexpr int kMegaMoEBackwardBlockM = layout::MegaMoEBackwardBuffer::kBlockM;
+static constexpr int kMegaMoEBackwardNumThreads = 256;
+static constexpr int kMegaMoEBackwardStageABytes = 128 * 64 * 2;
+static constexpr int kMegaMoEBackwardStageBBytes = 128 * 32 * 2;
+
+static int get_mega_moe_backward_smem_size(const int& num_stages) {
+    return num_stages * (kMegaMoEBackwardStageABytes + kMegaMoEBackwardStageBBytes) + 8192;
 }
 
 static MegaMoEBackwardConfig get_mega_moe_backward_config(
@@ -47,18 +42,13 @@ static MegaMoEBackwardConfig get_mega_moe_backward_config(
     const int& num_sf_ring_tokens,
     const MmaKind& mma_kind) {
     DG_HOST_ASSERT(mma_kind == MmaKind::BF16);
-    DG_HOST_ASSERT(hidden % 8 == 0 and intermediate_hidden % 8 == 0);
-    int block_m = 8;
-    for (const int& candidate: {32, 16, 8}) {
-        if (get_mega_moe_backward_smem_size(candidate, hidden, intermediate_hidden) <= SM100ArchSpec::smem_capacity) {
-            block_m = candidate;
-            break;
-        }
-    }
-    const auto smem_size = get_mega_moe_backward_smem_size(block_m, hidden, intermediate_hidden);
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
-
-    return MegaMoEBackwardConfig{block_m, 256, smem_size};
+    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+    int num_stages = 8;
+    while (get_mega_moe_backward_smem_size(num_stages) > SM100ArchSpec::smem_capacity)
+        --num_stages;
+    DG_HOST_ASSERT(num_stages >= 2);
+    return MegaMoEBackwardConfig{kMegaMoEBackwardBlockM, kMegaMoEBackwardNumThreads, num_stages,
+                                 get_mega_moe_backward_smem_size(num_stages)};
 }
 
 } // namespace deep_gemm

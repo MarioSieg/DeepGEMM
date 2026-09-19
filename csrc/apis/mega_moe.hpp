@@ -85,8 +85,8 @@ get_symm_buffer_size_for_mega_moe(
     );
 
     const auto mega_backward_buffer = layout::MegaMoEBackwardBuffer(
-        mega_buffer.get_end_ptr(), hidden, num_max_tokens_per_rank, num_topk, num_shared_experts,
-        mega_buffer.workspace.num_max_pool_tokens
+        mega_buffer.get_end_ptr(), hidden, intermediate_hidden, num_max_tokens_per_rank, num_topk, num_shared_experts,
+        mega_buffer.workspace.num_max_pool_tokens, num_sms
     );
 
     // Check SF buffer requirements
@@ -503,8 +503,8 @@ static void bf16_mega_moe_backward(
         num_shared_experts
     );
     const auto bwd_buffer = layout::MegaMoEBackwardBuffer(
-        mega_buffer.get_end_ptr(), hidden, num_max_tokens_per_rank, num_topk, num_shared_experts,
-        mega_buffer.workspace.num_max_pool_tokens
+        mega_buffer.get_end_ptr(), hidden, intermediate_hidden, num_max_tokens_per_rank, num_topk, num_shared_experts,
+        mega_buffer.workspace.num_max_pool_tokens, runtime->get_num_sms()
     );
     auto dy_view = torch::from_blob(
         math::advance_ptr(sym_buffer.data_ptr(), reinterpret_cast<int64_t>(bwd_buffer.input_dy_buffer.base)),
@@ -523,7 +523,7 @@ static void bf16_mega_moe_backward(
                                      l1_weights, l2_weights,
                                      shared_l1_weights_ptr, shared_l2_weights_ptr,
                                      shared_dw1_weights_ptr, shared_dw2_weights_ptr,
-                                     sym_buffer_ptrs,
+                                     sym_buffer, sym_buffer_ptrs,
                                      rank_idx, num_max_tokens_per_rank,
                                      num_experts_per_rank,
                                      num_shared_experts,

@@ -466,6 +466,8 @@ struct MegaMoEBackwardBuffer {
         uint32_t pool_begin;
         uint32_t valid_m;
     };
+    static constexpr uint32_t kBlockM = 32;
+    static constexpr uint32_t kNumStageSlots = 2;
     Buffer input_dy_buffer;
     Buffer dx_slot_buffer;
     Buffer dtopk_weight_slot_buffer;
@@ -473,8 +475,15 @@ struct MegaMoEBackwardBuffer {
     uint32_t max_num_blocks;
     uint32_t* next_block;
     uint32_t* num_blocks;
+    void* stage_x;
+    void* stage_dy;
+    void* z_scratch;
+    void* hw_scratch;
+    void* dz_scratch;
+    uint64_t stage_bytes_per_sm, z_bytes_per_sm, hw_bytes_per_sm, dz_bytes_per_sm;
+    uint8_t* end;
     MegaMoEBackwardBuffer() = default;
-    CUTLASS_HOST_DEVICE MegaMoEBackwardBuffer(void* base, const uint32_t& hidden, const uint32_t& num_max_tokens_per_rank, const uint32_t& num_topk, const uint32_t& num_shared_experts, const uint32_t& num_max_pool_tokens) {
+    CUTLASS_HOST_DEVICE MegaMoEBackwardBuffer(void* base, const uint32_t& hidden, const uint32_t& intermediate_hidden, const uint32_t& num_max_tokens_per_rank, const uint32_t& num_topk, const uint32_t& num_shared_experts, const uint32_t& num_max_pool_tokens, const uint32_t& num_sms) {
         const auto bf16_token_layout = layout::Data(hidden * 2);
         input_dy_buffer = Buffer(bf16_token_layout, 1, num_max_tokens_per_rank, base);
         dx_slot_buffer = Buffer(
@@ -485,8 +494,20 @@ struct MegaMoEBackwardBuffer {
         block_desc = reinterpret_cast<BlockDesc*>(dtopk_weight_slot_buffer.get_end_ptr());
         next_block = reinterpret_cast<uint32_t*>(block_desc + max_num_blocks);
         num_blocks = next_block + 1;
+        const uint32_t num_passes = num_shared_experts > 0 ? num_shared_experts : 1u;
+        stage_bytes_per_sm = static_cast<uint64_t>(kNumStageSlots) * kBlockM * hidden * 2;
+        z_bytes_per_sm = static_cast<uint64_t>(2 * intermediate_hidden) * kBlockM * 4;
+        hw_bytes_per_sm = static_cast<uint64_t>(intermediate_hidden) * kBlockM * 2;
+        dz_bytes_per_sm = static_cast<uint64_t>(num_passes) * 2 * intermediate_hidden * kBlockM * 2;
+        auto* ptr = reinterpret_cast<uint8_t*>(next_block + 4);
+        stage_x = ptr; ptr += stage_bytes_per_sm * num_sms;
+        stage_dy = ptr; ptr += stage_bytes_per_sm * num_sms;
+        z_scratch = ptr; ptr += z_bytes_per_sm * num_sms;
+        hw_scratch = ptr; ptr += hw_bytes_per_sm * num_sms;
+        dz_scratch = ptr; ptr += dz_bytes_per_sm * num_sms;
+        end = ptr;
     }
-    [[nodiscard]] CUTLASS_HOST_DEVICE void* get_end_ptr() const { return num_blocks+1; }
+    [[nodiscard]] CUTLASS_HOST_DEVICE void* get_end_ptr() const { return end; }
     [[nodiscard]] CUTLASS_HOST_DEVICE int64_t get_num_bytes() const {
         return static_cast<uint8_t*>(get_end_ptr()) - static_cast<uint8_t*>(input_dy_buffer.base);
     }

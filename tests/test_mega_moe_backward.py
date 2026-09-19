@@ -17,7 +17,7 @@ def swiglu_mlp_forward(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
     intermediate = w1.shape[0] // 2
     gate, up = z[:, :intermediate], z[:, intermediate:]
     if clamp is not None:
-        gate = torch.minimum(gate, torch.full_like(gate, clamp))
+        gate = torch.clamp(gate, max=clamp)
         up = torch.clamp(up, -clamp, clamp)
     h = gate * torch.sigmoid(gate) * up
     return h @ w2.t()
