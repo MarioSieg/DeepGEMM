@@ -101,22 +101,39 @@ def _test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.barrier()
     torch.cuda.synchronize()
 
-    dx = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    dw1_weights = torch.zeros_like(l1_weights, dtype=torch.float32)
-    dw2_weights = torch.zeros_like(l2_weights, dtype=torch.float32)
-    dtopk_weights = torch.zeros((num_tokens, num_topk), dtype=torch.float32, device='cuda')
-    shared_dw1_weights = torch.zeros_like(shared_l1_weights, dtype=torch.float32) if has_shared else None
-    shared_dw2_weights = torch.zeros_like(shared_l2_weights, dtype=torch.float32) if has_shared else None
+    def run_forward():
+        y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        deep_gemm.bf16_mega_moe(
+            y, transformed_l1_weights, transformed_l2_weights, buffer,
+            shared_l1_weights=transformed_shared_l1_weights, shared_l2_weights=transformed_shared_l2_weights,
+            activation_clamp=clamp, fast_math=bool(args.fast_math))
+        return y
 
-    deep_gemm.bf16_mega_moe_backward(
-        dx, dw1_weights, dw2_weights, dtopk_weights, dy,
-        transformed_l1_weights, transformed_l2_weights,
-        buffer,
-        shared_l1_weights=transformed_shared_l1_weights, shared_l2_weights=transformed_shared_l2_weights,
-        shared_dw1_weights=shared_dw1_weights, shared_dw2_weights=shared_dw2_weights,
-        activation_clamp=clamp, fast_math=bool(args.fast_math))
+    def run_backward():
+        dx = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        dw1_weights = torch.zeros_like(l1_weights, dtype=torch.float32)
+        dw2_weights = torch.zeros_like(l2_weights, dtype=torch.float32)
+        dtopk_weights = torch.zeros((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+        shared_dw1_weights = torch.zeros_like(shared_l1_weights, dtype=torch.float32) if has_shared else None
+        shared_dw2_weights = torch.zeros_like(shared_l2_weights, dtype=torch.float32) if has_shared else None
+        deep_gemm.bf16_mega_moe_backward(
+            dx, dw1_weights, dw2_weights, dtopk_weights, dy,
+            transformed_l1_weights, transformed_l2_weights,
+            buffer,
+            shared_l1_weights=transformed_shared_l1_weights, shared_l2_weights=transformed_shared_l2_weights,
+            shared_dw1_weights=shared_dw1_weights, shared_dw2_weights=shared_dw2_weights,
+            activation_clamp=clamp, fast_math=bool(args.fast_math))
+        return dx, dw1_weights, dw2_weights, dtopk_weights, shared_dw1_weights, shared_dw2_weights
+
+    y_first = run_forward()
+    first = run_backward()
+    y_second = run_forward()
+    dx, dw1_weights, dw2_weights, dtopk_weights, shared_dw1_weights, shared_dw2_weights = run_backward()
     torch.cuda.synchronize()
     dist.barrier()
+    assert torch.equal(y_first, y_second), f'[rank {rank_idx}] forward output changed after a backward on the same buffer'
+    for name, a, b in zip(('dx', 'dw1', 'dw2', 'dtopk'), first, (dx, dw1_weights, dw2_weights, dtopk_weights)):
+        assert calc_diff(a, b) < 1e-6, f'[rank {rank_idx}] {name} differs between two backward launches'
 
     def gather(t: torch.Tensor) -> torch.Tensor:
         out = [torch.empty_like(t) for _ in range(num_ranks)]

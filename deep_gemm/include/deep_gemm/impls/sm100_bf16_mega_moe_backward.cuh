@@ -766,6 +766,13 @@ sm100_bf16_mega_moe_backward_impl(
     if (warp == 0)
         cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
 
+    for (uint32_t i = global_tid; i < kNumExperts; i += kNumGlobalThreads) {
+        *workspace.get_expert_send_count_ptr(i) = 0;
+        *workspace.get_expert_recv_count_ptr(i / kNumExpertsPerRank, i % kNumExpertsPerRank) = 0;
+    }
+    for (uint32_t i = global_tid; i < kNumExpertsPerRank; i += kNumGlobalThreads)
+        *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+
     for (uint64_t linear = static_cast<uint64_t>(sm_idx)*kNumThreads + tid;
          linear < static_cast<uint64_t>(num_tokens)*kHidden;
          linear += static_cast<uint64_t>(kNumSMs)*kNumThreads) {
