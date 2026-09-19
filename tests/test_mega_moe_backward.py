@@ -49,7 +49,7 @@ def moe_reference_forward(x: torch.Tensor, topk_idx: torch.Tensor, topk_weights:
 
 
 # noinspection PyUnboundLocalVariable,PyShadowingNames
-def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+def _test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
@@ -194,4 +194,4 @@ if __name__ == '__main__':
     parser.add_argument('--tolerance', type=float, default=1e-3, help='Max allowed `calc_diff` (global relative error)')
     args = parser.parse_args()
 
-    torch.multiprocessing.spawn(test, args=(args.num_processes, args), nprocs=args.num_processes)
+    torch.multiprocessing.spawn(_test, args=(args.num_processes, args), nprocs=args.num_processes)

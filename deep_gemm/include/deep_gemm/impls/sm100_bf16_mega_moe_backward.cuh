@@ -34,7 +34,7 @@ namespace deep_gemm {
         float kActivationClamp,
         bool kFastMath,
         uint32_t kNumThreads,
-        bool kHasShared=kNumSharedExperts > 0,
+        bool kHasShared=(kNumSharedExperts > 0),
         uint32_t kNumExpertsPerRank=kNumExperts / kNumRanks,
         uint32_t kNumWarps=(kNumThreads>>5),
         uint32_t kGran=8
@@ -84,7 +84,6 @@ namespace deep_gemm {
             workspace.num_max_pool_tokens
         );
         using BlockDesc=layout::MegaMoEBackwardBuffer::BlockDesc;
-
         for (uint32_t i=global_tid; i < kNumExperts; i += kNumGlobalThreads)
             *workspace.get_expert_send_count_ptr(i)=0;
         for (uint32_t i=global_tid; i < kNumExpertsPerRank; i += kNumGlobalThreads)
@@ -101,7 +100,6 @@ namespace deep_gemm {
             *sym_buffer.map(dst_ptr, dst_rank)=idx;
         }
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, 102>(workspace, sym_buffer, sm_idx, tid, [&]() { __syncthreads(); });
-        
         for (uint32_t i=global_tid; i < kNumExperts; i += kNumGlobalThreads) {
             auto dst_rank=i / kNumExpertsPerRank;
             auto dst_local_expert=i % kNumExpertsPerRank;
@@ -257,8 +255,6 @@ namespace deep_gemm {
                     smem.h[row][j]=gate*sigmoid<kFastMath>(gate)*up;
                 }
                 __syncthreads();
-
-                // 3. dH_raw=dY @ W2 (unweighted; used only to derive dtopk_weight).
                 for (uint32_t row=warp; row < valid_m; row += kNumWarps) {
                     for (uint32_t j=lane; j < kIntermediateHidden; j += 32) {
                         float acc=0.0f;
@@ -269,8 +265,6 @@ namespace deep_gemm {
                     }
                 }
                 __syncthreads();
-
-                // 3b. dtopk_weight=dot(H, dH_raw); then scale dH by the route weight.
                 for (uint32_t row=warp; row < valid_m; row += kNumWarps) {
                     float partial=0.0f;
                     for (uint32_t j=lane; j < kIntermediateHidden; j += 32)
