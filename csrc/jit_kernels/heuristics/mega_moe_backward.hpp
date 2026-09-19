@@ -26,16 +26,16 @@ struct MegaMoEBackwardConfig {
 
 static int get_mega_moe_backward_smem_size(const int& block_m, const int& hidden, const int& intermediate_hidden) {
     constexpr int kAlign = 1024;
-    const auto a = [&](const int& n) { return math::align(n, kAlign); };
+    const auto AL = [&](const int& n) { return math::align(n, kAlign); };
     const int smem_size =
-        a(block_m * hidden * 2) +                     // x
-        a(block_m * hidden * 2) +                      // dy
-        a(block_m * 2 * intermediate_hidden * 4) +     // z
-        a(block_m * intermediate_hidden * 4) +          // h
-        a(block_m * intermediate_hidden * 4) +          // dh
-        a(block_m * 2 * intermediate_hidden * 4) +      // dz
-        a(block_m * hidden * 4) +                        // dx_local
-        4096;                                              // route_weight + src rank/token/topk + slack
+        AL(2*block_m*hidden*2) +
+        AL(2*block_m*hidden*2) +
+        AL(block_m*2*intermediate_hidden*4) +
+        AL(block_m*intermediate_hidden*4) +
+        AL(block_m*intermediate_hidden*4) +
+        AL(block_m*2*intermediate_hidden*4) +
+        AL(block_m*hidden*4) +
+        8192;
     return smem_size;
 }
 

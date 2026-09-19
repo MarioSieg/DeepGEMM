@@ -218,7 +218,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 // Arrive only at the leader CTA
                 shared_storage.tmem_empty_barriers[i].init(2 * kNumEpilogueThreads);
             }
-            #pragma unroll
+            #pragma unrollx
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
                 shared_storage.combine_barriers[i].init(1);
             #pragma unroll
