@@ -464,23 +464,31 @@ struct MegaMoEBackwardBuffer {
     struct alignas(16) BlockDesc {
         uint32_t local_expert;
         uint32_t pool_begin;
+        uint32_t meta_begin;
         uint32_t valid_m;
     };
-    static constexpr uint32_t kBlockM = 32;
+    static constexpr uint32_t kBlockM = 128;
     static constexpr uint32_t kNumStageSlots = 2;
+    static constexpr uint32_t kMaxExpertSlots = 1024;
     Buffer input_dy_buffer;
     Buffer dx_slot_buffer;
     Buffer dtopk_weight_slot_buffer;
     BlockDesc* block_desc;
     uint32_t max_num_blocks;
-    uint32_t* next_block;
+    uint32_t num_pool_rows;
+    uint32_t shared_region_stride;
+    uint32_t* next_item;
     uint32_t* num_blocks;
-    void* stage_x;
-    void* stage_dy;
+    uint32_t* num_items;
+    uint32_t* expert_pool_base;
+    uint32_t* expert_num_blocks;
+    uint32_t* expert_done;
+    void* x_pool;
+    void* dy_pool;
+    void* dz_pool;
+    void* hw_pool;
     void* z_scratch;
-    void* hw_scratch;
-    void* dz_scratch;
-    uint64_t stage_bytes_per_sm, z_bytes_per_sm, hw_bytes_per_sm, dz_bytes_per_sm;
+    uint64_t z_bytes_per_sm;
     uint8_t* end;
     MegaMoEBackwardBuffer() = default;
     CUTLASS_HOST_DEVICE MegaMoEBackwardBuffer(void* base, const uint32_t& hidden, const uint32_t& intermediate_hidden, const uint32_t& num_max_tokens_per_rank, const uint32_t& num_topk, const uint32_t& num_shared_experts, const uint32_t& num_max_pool_tokens, const uint32_t& num_sms) {
@@ -492,19 +500,23 @@ struct MegaMoEBackwardBuffer {
         dtopk_weight_slot_buffer = Buffer(layout::Data(sizeof(float), false), num_topk, num_max_tokens_per_rank,dx_slot_buffer.get_end_ptr());
         max_num_blocks = math::ceil_div<uint32_t>(num_max_pool_tokens, kMinCandidateBlockM) + math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM) + 1;
         block_desc = reinterpret_cast<BlockDesc*>(dtopk_weight_slot_buffer.get_end_ptr());
-        next_block = reinterpret_cast<uint32_t*>(block_desc + max_num_blocks);
-        num_blocks = next_block + 1;
-        const uint32_t num_passes = num_shared_experts > 0 ? num_shared_experts : 1u;
-        stage_bytes_per_sm = static_cast<uint64_t>(kNumStageSlots) * kBlockM * hidden * 2;
+        auto* counters = reinterpret_cast<uint32_t*>(block_desc + max_num_blocks);
+        next_item = counters;
+        num_blocks = counters + 1;
+        num_items = counters + 2;
+        expert_pool_base = counters + 4;
+        expert_num_blocks = expert_pool_base + kMaxExpertSlots;
+        expert_done = expert_num_blocks + kMaxExpertSlots;
+        shared_region_stride = math::align<uint32_t>(num_max_tokens_per_rank, kBlockM);
+        num_pool_rows = math::align<uint32_t>(num_max_pool_tokens, kBlockM) + kBlockM +
+            (num_shared_experts > 0 ? num_shared_experts * shared_region_stride : 0u);
+        auto* ptr = reinterpret_cast<uint8_t*>(math::align<uint64_t>(reinterpret_cast<uint64_t>(expert_done + kMaxExpertSlots), 1024));
+        x_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * hidden * 2;
+        dy_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * hidden * 2;
+        dz_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * 2 * intermediate_hidden * 2;
+        hw_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * intermediate_hidden * 2;
         z_bytes_per_sm = static_cast<uint64_t>(2 * intermediate_hidden) * kBlockM * 4;
-        hw_bytes_per_sm = static_cast<uint64_t>(intermediate_hidden) * kBlockM * 2;
-        dz_bytes_per_sm = static_cast<uint64_t>(num_passes) * 2 * intermediate_hidden * kBlockM * 2;
-        auto* ptr = reinterpret_cast<uint8_t*>(next_block + 4);
-        stage_x = ptr; ptr += stage_bytes_per_sm * num_sms;
-        stage_dy = ptr; ptr += stage_bytes_per_sm * num_sms;
         z_scratch = ptr; ptr += z_bytes_per_sm * num_sms;
-        hw_scratch = ptr; ptr += hw_bytes_per_sm * num_sms;
-        dz_scratch = ptr; ptr += dz_bytes_per_sm * num_sms;
         end = ptr;
     }
     [[nodiscard]] CUTLASS_HOST_DEVICE void* get_end_ptr() const { return end; }

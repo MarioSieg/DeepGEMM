@@ -28,10 +28,10 @@ struct MegaMoEBackwardConfig {
 static constexpr int kMegaMoEBackwardBlockM = layout::MegaMoEBackwardBuffer::kBlockM;
 static constexpr int kMegaMoEBackwardNumThreads = 256;
 static constexpr int kMegaMoEBackwardStageABytes = 128 * 64 * 2;
-static constexpr int kMegaMoEBackwardStageBBytes = 128 * 32 * 2;
+static constexpr int kMegaMoEBackwardStageBBytes = kMegaMoEBackwardBlockM * 64 * 2;
 
 static int get_mega_moe_backward_smem_size(const int& num_stages) {
-    return num_stages * (kMegaMoEBackwardStageABytes + kMegaMoEBackwardStageBBytes) + 8192;
+    return num_stages * (kMegaMoEBackwardStageABytes + kMegaMoEBackwardStageBBytes) + 16384;
 }
 
 static MegaMoEBackwardConfig get_mega_moe_backward_config(

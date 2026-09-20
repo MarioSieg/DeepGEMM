@@ -8,8 +8,8 @@
 
 namespace deep_gemm::comm {
 
-// 60s timeout, at 2 GHz
-constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
+// 600s timeout, at 2 GHz
+constexpr int64_t kNumTimeoutCycles = 600ll * 2000000000ll;
 
 // Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
 template <typename pred_t, typename print_timeout_t>

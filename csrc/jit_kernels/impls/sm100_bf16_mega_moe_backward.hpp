@@ -38,7 +38,6 @@ static void sm100_bf16_mega_moe_backward(
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, 0, MmaKind::BF16);
     constexpr int kBlockM = kMegaMoEBackwardBlockM;
-    const int num_passes = num_shared_experts > 0 ? num_shared_experts : 1;
 
     const auto mega_buffer = layout::MegaMoEBuffer(
         nullptr, hidden, intermediate_hidden,
@@ -52,10 +51,11 @@ static void sm100_bf16_mega_moe_backward(
     const auto view = [&](void* offset, const int64_t& rows, const int64_t& cols) {
         return torch::from_blob(math::advance_ptr(sym_buffer.data_ptr(), reinterpret_cast<int64_t>(offset)), {rows, cols}, bf16_opts);
     };
-    const auto stage_x = view(bwd_buffer.stage_x, static_cast<int64_t>(num_sms) * layout::MegaMoEBackwardBuffer::kNumStageSlots * kBlockM, hidden);
-    const auto stage_dy = view(bwd_buffer.stage_dy, static_cast<int64_t>(num_sms) * layout::MegaMoEBackwardBuffer::kNumStageSlots * kBlockM, hidden);
-    const auto hw_scratch = view(bwd_buffer.hw_scratch, static_cast<int64_t>(num_sms) * intermediate_hidden, kBlockM);
-    const auto dz_scratch = view(bwd_buffer.dz_scratch, static_cast<int64_t>(num_sms) * num_passes * 2 * intermediate_hidden, kBlockM);
+    const auto num_pool_rows = static_cast<int64_t>(bwd_buffer.num_pool_rows);
+    const auto x_pool = view(bwd_buffer.x_pool, num_pool_rows, hidden);
+    const auto dy_pool = view(bwd_buffer.dy_pool, num_pool_rows, hidden);
+    const auto dz_pool = view(bwd_buffer.dz_pool, 2 * intermediate_hidden, num_pool_rows);
+    const auto hw_pool = view(bwd_buffer.hw_pool, intermediate_hidden, num_pool_rows);
 
     const auto tensor_map_w1_k = make_tma_2d_desc(w1_weights, hidden, num_experts_per_rank * 2 * intermediate_hidden, 64, 128, hidden, 128);
     const auto tensor_map_w1_mn = make_tma_2d_desc(w1_weights, hidden, num_experts_per_rank * 2 * intermediate_hidden, 64, 64, hidden, 128);
@@ -66,11 +66,13 @@ static void sm100_bf16_mega_moe_backward(
         make_tma_2d_desc(*shared_w1_weights, hidden, num_shared_experts * 2 * intermediate_hidden, 64, 64, hidden, 128) : tensor_map_w1_mn;
     const auto tensor_map_shared_w2_mn = num_shared_experts > 0 ?
         make_tma_2d_desc(*shared_w2_weights, num_shared_experts * intermediate_hidden, hidden, 64, 64, num_shared_experts * intermediate_hidden, 128) : tensor_map_w2_mn;
-    const auto tensor_map_stage_x = make_tma_2d_desc(stage_x, hidden, static_cast<int>(stage_x.size(0)), 64, kBlockM, hidden, 128);
-    const auto tensor_map_stage_dy = make_tma_2d_desc(stage_dy, hidden, static_cast<int>(stage_dy.size(0)), 64, kBlockM, hidden, 128);
-    const auto tensor_map_hw = make_tma_2d_desc(hw_scratch, kBlockM, static_cast<int>(hw_scratch.size(0)), kBlockM, 128, kBlockM, 64);
-    const auto tensor_map_dz_k = make_tma_2d_desc(dz_scratch, kBlockM, static_cast<int>(dz_scratch.size(0)), kBlockM, 128, kBlockM, 64);
-    const auto tensor_map_dz_mn = make_tma_2d_desc(dz_scratch, kBlockM, static_cast<int>(dz_scratch.size(0)), kBlockM, 64, kBlockM, 64);
+    const auto tensor_map_x_k = make_tma_2d_desc(x_pool, hidden, static_cast<int>(num_pool_rows), 64, kBlockM, hidden, 128);
+    const auto tensor_map_x_mn = make_tma_2d_desc(x_pool, hidden, static_cast<int>(num_pool_rows), 64, 64, hidden, 128);
+    const auto tensor_map_dy_k = make_tma_2d_desc(dy_pool, hidden, static_cast<int>(num_pool_rows), 64, kBlockM, hidden, 128);
+    const auto tensor_map_dy_mn = make_tma_2d_desc(dy_pool, hidden, static_cast<int>(num_pool_rows), 64, 64, hidden, 128);
+    const auto tensor_map_dz_k = make_tma_2d_desc(dz_pool, static_cast<int>(num_pool_rows), 2 * intermediate_hidden, 64, 128, static_cast<int>(num_pool_rows), 128);
+    const auto tensor_map_dz_mn = make_tma_2d_desc(dz_pool, static_cast<int>(num_pool_rows), 2 * intermediate_hidden, 64, 64, static_cast<int>(num_pool_rows), 128);
+    const auto tensor_map_hw_k = make_tma_2d_desc(hw_pool, static_cast<int>(num_pool_rows), intermediate_hidden, 64, 128, static_cast<int>(num_pool_rows), 128);
 
     float* shared_dw1_ptr = nullptr;
     float* shared_dw2_ptr = nullptr;
@@ -118,8 +120,8 @@ static void __instantiate_kernel() {{
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         tensor_map_w1_k, tensor_map_w1_mn, tensor_map_w2_mn,
         tensor_map_shared_w1_k, tensor_map_shared_w1_mn, tensor_map_shared_w2_mn,
-        tensor_map_stage_x, tensor_map_stage_dy,
-        tensor_map_hw, tensor_map_dz_k, tensor_map_dz_mn);
+        tensor_map_x_k, tensor_map_x_mn, tensor_map_dy_k, tensor_map_dy_mn,
+        tensor_map_dz_k, tensor_map_dz_mn, tensor_map_hw_k);
 }
 
 }
