@@ -8,6 +8,8 @@
 #include <deep_gemm/scheduler/mega_moe.cuh>
 
 #include "../runtime/runtime.hpp"
+#include "../jit_kernels/impls/sm90_bf16_mega_moe.hpp"
+#include "../jit_kernels/impls/sm90_bf16_mega_moe_backward.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe_backward.hpp"
@@ -388,6 +390,20 @@ static void bf16_mega_moe(
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
                             activation_clamp, fast_math);
+    } else if (arch_major == 9) {
+        sm90_bf16_mega_moe(y,
+                           l1_acts, l2_acts,
+                           shared_l1_acts, shared_l2_acts,
+                           l1_weights, l2_weights,
+                           shared_l1_weights, shared_l2_weights,
+                           cumulative_local_expert_recv_stats,
+                           sym_buffer_ptrs,
+                           rank_idx, num_max_tokens_per_rank,
+                           num_experts_per_rank,
+                           num_shared_experts,
+                           num_tokens, num_topk,
+                           hidden, intermediate_hidden,
+                           activation_clamp, fast_math);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -532,6 +548,20 @@ static void bf16_mega_moe_backward(
                                      hidden, intermediate_hidden,
                                      num_ring_tokens,
                                      activation_clamp, fast_math, dw_natural_layout);
+    } else if (arch_major == 9) {
+        sm90_bf16_mega_moe_backward(dx,
+                                    dw1_weights, dw2_weights, dtopk_weights,
+                                    l1_weights, l2_weights,
+                                    shared_l1_weights_ptr, shared_l2_weights_ptr,
+                                    shared_dw1_weights_ptr, shared_dw2_weights_ptr,
+                                    sym_buffer, sym_buffer_ptrs,
+                                    rank_idx, num_max_tokens_per_rank,
+                                    num_experts_per_rank,
+                                    num_shared_experts,
+                                    num_tokens, num_topk,
+                                    hidden, intermediate_hidden,
+                                    num_ring_tokens,
+                                    activation_clamp, fast_math, dw_natural_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

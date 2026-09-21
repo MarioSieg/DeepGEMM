@@ -12,11 +12,17 @@ CUTLASS_HOST_DEVICE void host_device_printf(const char* format, ...) {
 #define printf host_device_printf
 #endif
 
+// Device-side prints (timeouts, assertions). Kernels may compile them out by defining this macro first:
+// any real function call (e.g. `printf`) in a WGMMA kernel makes PTXAS serialize the WGMMA pipeline (C7510)
+#ifndef DG_DEVICE_PRINTF
+#define DG_DEVICE_PRINTF(...) printf(__VA_ARGS__)
+#endif
+
 #ifndef DG_DEVICE_ASSERT
 #define DG_DEVICE_ASSERT(cond) \
 do { \
     if (not (cond)) { \
-        printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
+        DG_DEVICE_PRINTF("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
         asm("trap;"); \
     } \
 } while (0)

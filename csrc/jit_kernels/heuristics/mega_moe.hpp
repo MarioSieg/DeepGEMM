@@ -15,6 +15,7 @@
 
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
+#include "sm90.hpp"
 #include "sm100.hpp"
 
 namespace deep_gemm {
@@ -239,6 +240,135 @@ static MegaMoEConfig get_mega_moe_config(
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = std::format(
             "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+        static std::unordered_set<std::string> printed;
+        if (printed.count(key) == 0) {
+            std::cout << key << ": " << config << std::endl;
+            printed.insert(key);
+        }
+    }
+    return config;
+}
+
+// SM90 (Hopper) configs: 2-CTA clusters, swap-AB WGMMA with 2 math warpgroups (64 weight rows each),
+// TMA multicast of the whole token block, and 16-token `stmatrix.trans` epilogue atoms
+// Ping-pong math warpgroups (each owns whole tasks) for `block_m <= 64`, cooperative otherwise; must match the kernel
+static bool is_sm90_mega_moe_ping_pong(const int& block_m) {
+    return block_m <= 64;
+}
+
+static int get_sm90_store_block_m_for_mega_moe(const int& block_m) {
+    // The store block must be a multiple of 16 and divide `block_m`
+    DG_HOST_ASSERT(block_m % 16 == 0);
+    if (block_m <= 32)
+        return block_m;
+    return block_m % 32 == 0 ? 32 : 48;
+}
+
+static std::pair<int, int> get_sm90_pipeline_config_for_mega_moe(
+    const int& smem_capacity,
+    const int& num_experts,
+    const int& block_m, const int& block_n, const int& block_k,
+    const int& num_bytes_per_pull, const int& store_block_m,
+    const int& num_dispatch_warps, const int& num_math_warps) {
+    constexpr int kSmemAlignment = 1024;
+    constexpr int kNumTMAStoreStages = 2;
+    constexpr int kNumScheduleStages = 2;
+    const int num_math_warpgroups = num_math_warps / 4;
+
+    // Dispatch region
+    const int smem_expert_count_size = align(
+        num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
+    const int smem_send_buffers_size = align(
+        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
+        kSmemAlignment);
+    const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
+
+    // C/D output region: per-warpgroup L1 tiles `[store_block_m, wg_block_n / 2]` (2 TMA stages) or
+    // L2 tiles `[store_block_m, wg_block_n]` (a single stage), which have the same size
+    const int wg_block_n = is_sm90_mega_moe_ping_pong(block_m) ? block_n : block_n / num_math_warpgroups;
+    const int smem_cd_l1 = num_math_warpgroups * kNumTMAStoreStages * store_block_m * (wg_block_n / 2) * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd_l2 = num_math_warpgroups * store_block_m * wg_block_n * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
+
+    // Schedule task payloads and barriers (dispatch + combine + schedule full/empty + per-stage full/empty)
+    const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(sched::TaskInfo<true>));
+    const int smem_barriers = (num_dispatch_warps + num_math_warps * 2 + kNumScheduleStages * 2) * 8;
+
+    // Per-stage: the whole token block (multicast) + this CTA's weight tile + full/empty barriers
+    const int smem_a_size_per_stage = block_m * block_k * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_b_size_per_stage = block_n * block_k * static_cast<int>(sizeof(nv_bfloat16));
+    DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
+    DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
+    const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + 2 * 8;
+
+    // Fixed total, with a slack for the struct paddings
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_task_info + smem_barriers + kSmemAlignment;
+
+    // Select maximum number of stages
+    const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
+    DG_HOST_ASSERT(num_stages >= 2);
+
+    return {num_stages, align(smem_fixed + num_stages * smem_size_per_stage, kSmemAlignment)};
+}
+
+static MegaMoEConfig get_sm90_mega_moe_config(
+    const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
+    const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const int& num_ring_tokens,
+    const MmaKind& mma_kind) {
+    DG_HOST_ASSERT(mma_kind == MmaKind::BF16);
+
+    // Block config: reuse the SM100 block M selection, but the SM90 epilogue works on 16-token atoms, and
+    // 240-token blocks (120 accumulators per thread) do not fit the SM90 math register budget
+    constexpr int kNumMaxBlockM = 192;
+    auto [cluster_size, block_m, _, block_k, num_math_threads] =
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+    block_m = std::clamp(block_m, 16, kNumMaxBlockM);
+    DG_HOST_ASSERT(cluster_size == 2 and block_k == 64 and num_math_threads == 256);
+    DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
+    const int store_block_m = get_sm90_store_block_m_for_mega_moe(block_m);
+    const int block_n = 128;
+    const int load_block_m = block_m;
+    const int load_block_n = block_n;
+    const int swizzle_acts_mode = 128;
+    const int swizzle_weights_mode = 128;
+
+    // Thread layout: dispatch warpgroup, TMA/scheduler warpgroup, 2 math warpgroups
+    const int num_dispatch_threads = 128;
+    const int num_tma_threads = 128;
+
+    // Pull: divide token bytes by 2 until <= num_max_pull_bytes
+    constexpr int num_max_pull_bytes = 4096;
+    int num_bytes_per_pull = hidden * get_num_mma_elem_bytes(mma_kind);
+    while (num_bytes_per_pull > num_max_pull_bytes) {
+        DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
+        num_bytes_per_pull /= 2;
+    }
+
+    // Pipeline
+    const auto [num_stages, smem_size] = get_sm90_pipeline_config_for_mega_moe(
+        SM90ArchSpec::smem_capacity,
+        num_experts,
+        block_m, block_n, block_k, num_bytes_per_pull, store_block_m,
+        num_dispatch_threads / 32, num_math_threads / 32);
+
+    const auto config = MegaMoEConfig {
+        block_m, block_n, block_k,
+        load_block_m, load_block_n, store_block_m,
+        0, 0,
+        num_ring_tokens, 0,
+        swizzle_acts_mode, swizzle_weights_mode,
+        num_stages, smem_size,
+        num_dispatch_threads, num_tma_threads, num_math_threads,
+        num_bytes_per_pull
+    };
+
+    // Print configs for the first time
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = std::format(
+            "SM90MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {

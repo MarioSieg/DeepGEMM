@@ -135,6 +135,8 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
+The BF16 variants (`bf16_mega_moe` and the training backward `bf16_mega_moe_backward`) are available on both SM90 and SM100; the FP8xFP4/FP8xFP8 forward is SM100-only. The SM90 kernels use the same symmetric buffer and weight layouts, so no caller-side changes are needed when switching architectures.
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

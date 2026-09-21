@@ -220,6 +220,17 @@ CUTLASS_DEVICE T warp_reduce(T value, Op op) {
     return value;
 }
 
+// Byte-offset swizzling matching the TMA/GMMA `kSwizzleMode`B patterns (`Swizzle<log2(kSwizzleMode / 16), 4, 3>`):
+// the 16B-chunk bits are XOR-ed with the 128B-row bits, so the base must be aligned to `8 * kSwizzleMode` bytes
+template <uint32_t kSwizzleMode>
+CUTLASS_DEVICE constexpr uint32_t swizzle_byte_offset(const uint32_t& offset) {
+    DG_STATIC_ASSERT(kSwizzleMode == 0 or kSwizzleMode == 32 or kSwizzleMode == 64 or kSwizzleMode == 128, "Invalid swizzling mode");
+    if constexpr (kSwizzleMode == 0)
+        return offset;
+    constexpr uint32_t kNumChunkBits = kSwizzleMode == 128 ? 3 : kSwizzleMode == 64 ? 2 : 1;
+    return offset ^ (((offset >> 7) & ((1u << kNumChunkBits) - 1)) << 4);
+}
+
 // Convenience aliases
 template <uint32_t kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
 CUTLASS_DEVICE T warp_reduce_sum(T value) {

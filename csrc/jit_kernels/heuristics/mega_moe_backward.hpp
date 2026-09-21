@@ -5,6 +5,7 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
+#include "sm90.hpp"
 #include "sm100.hpp"
 
 namespace deep_gemm {
@@ -49,6 +50,30 @@ static MegaMoEBackwardConfig get_mega_moe_backward_config(
     DG_HOST_ASSERT(num_stages >= 2);
     return MegaMoEBackwardConfig{kMegaMoEBackwardBlockM, kMegaMoEBackwardNumThreads, num_stages,
                                  get_mega_moe_backward_smem_size(num_stages)};
+}
+
+static constexpr int kSM90MegaMoEBackwardNumThreads = 384;
+static constexpr int kSM90MegaMoEBackwardFixedSmemBytes = 24576;
+
+static int get_sm90_mega_moe_backward_smem_size(const int& num_stages) {
+    return num_stages * (kMegaMoEBackwardStageABytes + kMegaMoEBackwardStageBBytes) + kSM90MegaMoEBackwardFixedSmemBytes;
+}
+
+static MegaMoEBackwardConfig get_sm90_mega_moe_backward_config(
+    const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
+    const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const int& num_ring_tokens,
+    const int& num_sf_ring_tokens,
+    const MmaKind& mma_kind) {
+    DG_HOST_ASSERT(mma_kind == MmaKind::BF16);
+    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+    int num_stages = 8;
+    while (get_sm90_mega_moe_backward_smem_size(num_stages) > SM90ArchSpec::smem_capacity)
+        -- num_stages;
+    DG_HOST_ASSERT(num_stages >= 2);
+    return MegaMoEBackwardConfig{kMegaMoEBackwardBlockM, kSM90MegaMoEBackwardNumThreads, num_stages,
+                                 get_sm90_mega_moe_backward_smem_size(num_stages)};
 }
 
 } // namespace deep_gemm
