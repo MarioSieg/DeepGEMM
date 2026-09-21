@@ -120,9 +120,10 @@ def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # Transpose
     g, n, *rest = t.shape
     half = n // 2
-    gate = t[:, :half].reshape(g, half // gran, gran, *rest)
-    up = t[:, half:].reshape(g, half // gran, gran, *rest)
-    result = torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    result = torch.empty_like(t)
+    view = result.view(g, half // gran, 2, gran, *rest)
+    view[:, :, 0].copy_(t[:, :half].reshape(g, half // gran, gran, *rest))
+    view[:, :, 1].copy_(t[:, half:].reshape(g, half // gran, gran, *rest))
     return result.squeeze(0) if squeeze_group_dim else result
 
 
@@ -232,7 +233,8 @@ def bf16_mega_moe_backward(dx: torch.Tensor,
                            shared_dw2_weights: Optional[torch.Tensor] = None,
                            activation: str = 'swiglu',
                            activation_clamp: Optional[float] = None,
-                           fast_math: bool = True):
+                           fast_math: bool = True,
+                           dw_natural_layout: bool = False):
     _C.bf16_mega_moe_backward(
         dx,
         dw1_weights, dw2_weights, dtopk_weights,
@@ -247,5 +249,6 @@ def bf16_mega_moe_backward(dx: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        dw_natural_layout
     )

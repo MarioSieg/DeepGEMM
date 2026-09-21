@@ -109,20 +109,22 @@ def _test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation_clamp=clamp, fast_math=bool(args.fast_math))
         return y
 
+    dw_dtype = torch.bfloat16 if args.natural_bf16 else torch.float32
+
     def run_backward():
         dx = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        dw1_weights = torch.zeros_like(l1_weights, dtype=torch.float32)
-        dw2_weights = torch.zeros_like(l2_weights, dtype=torch.float32)
-        dtopk_weights = torch.zeros((num_tokens, num_topk), dtype=torch.float32, device='cuda')
-        shared_dw1_weights = torch.zeros_like(shared_l1_weights, dtype=torch.float32) if has_shared else None
-        shared_dw2_weights = torch.zeros_like(shared_l2_weights, dtype=torch.float32) if has_shared else None
+        dw1_weights = torch.empty_like(l1_weights, dtype=dw_dtype)
+        dw2_weights = torch.empty_like(l2_weights, dtype=dw_dtype)
+        dtopk_weights = torch.empty((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+        shared_dw1_weights = torch.empty_like(shared_l1_weights, dtype=dw_dtype) if has_shared else None
+        shared_dw2_weights = torch.empty_like(shared_l2_weights, dtype=dw_dtype) if has_shared else None
         deep_gemm.bf16_mega_moe_backward(
             dx, dw1_weights, dw2_weights, dtopk_weights, dy,
             transformed_l1_weights, transformed_l2_weights,
             buffer,
             shared_l1_weights=transformed_shared_l1_weights, shared_l2_weights=transformed_shared_l2_weights,
             shared_dw1_weights=shared_dw1_weights, shared_dw2_weights=shared_dw2_weights,
-            activation_clamp=clamp, fast_math=bool(args.fast_math))
+            activation_clamp=clamp, fast_math=bool(args.fast_math), dw_natural_layout=bool(args.natural_bf16))
         return dx, dw1_weights, dw2_weights, dtopk_weights, shared_dw1_weights, shared_dw2_weights
 
     y_first = run_forward()
@@ -168,21 +170,21 @@ def _test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     elo, ehi = rank_idx * num_experts_per_rank, (rank_idx + 1) * num_experts_per_rank
 
     dx_ref = x_all.grad[lo:hi]
-    dw1_ref = _interleave_weights(l1_all.grad[elo:ehi])
+    dw1_ref = l1_all.grad[elo:ehi] if args.natural_bf16 else _interleave_weights(l1_all.grad[elo:ehi])
     dw2_ref = l2_all.grad[elo:ehi]
     dtopk_ref = topk_weights_all.grad[lo:hi]
 
     errs = {
         'dx': calc_diff(dx.float(), dx_ref),
-        'dw1': calc_diff(dw1_weights, dw1_ref),
-        'dw2': calc_diff(dw2_weights, dw2_ref),
+        'dw1': calc_diff(dw1_weights.float(), dw1_ref),
+        'dw2': calc_diff(dw2_weights.float(), dw2_ref),
         'dtopk_weights': calc_diff(dtopk_weights, dtopk_ref),
     }
     if has_shared:
-        dshared_w1_ref = _interleave_weights(shared_l1_all.grad[rank_idx])
+        dshared_w1_ref = shared_l1_all.grad[rank_idx] if args.natural_bf16 else _interleave_weights(shared_l1_all.grad[rank_idx])
         dshared_w2_ref = shared_l2_all.grad[rank_idx]
-        errs['shared_dw1'] = calc_diff(shared_dw1_weights, dshared_w1_ref)
-        errs['shared_dw2'] = calc_diff(shared_dw2_weights, dshared_w2_ref)
+        errs['shared_dw1'] = calc_diff(shared_dw1_weights.float(), dshared_w1_ref)
+        errs['shared_dw2'] = calc_diff(shared_dw2_weights.float(), dshared_w2_ref)
 
     print(f'[rank {rank_idx}] calc_diff: ' +
           ', '.join(f'{k}={v:.6f}' for k, v in errs.items()), flush=True)
@@ -209,6 +211,7 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.1, help='Fraction of topk slots to mask out')
     parser.add_argument('--fast-math', type=int, default=0, help='Enable fast math (0 or 1); 0 for a tight check')
     parser.add_argument('--tolerance', type=float, default=1e-3, help='Max allowed `calc_diff` (global relative error)')
+    parser.add_argument('--natural-bf16', type=int, default=0, help='Write dW in bf16 and the untransformed [gate; up] layout')
     args = parser.parse_args()
 
     torch.multiprocessing.spawn(_test, args=(args.num_processes, args), nprocs=args.num_processes)

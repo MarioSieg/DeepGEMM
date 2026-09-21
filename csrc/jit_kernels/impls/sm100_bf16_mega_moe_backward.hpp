@@ -28,7 +28,8 @@ static void sm100_bf16_mega_moe_backward(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& dw_natural_layout
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -74,12 +75,13 @@ static void sm100_bf16_mega_moe_backward(
     const auto tensor_map_dz_mn = make_tma_2d_desc(dz_pool, static_cast<int>(num_pool_rows), 2 * intermediate_hidden, 64, 64, static_cast<int>(num_pool_rows), 128);
     const auto tensor_map_hw_k = make_tma_2d_desc(hw_pool, static_cast<int>(num_pool_rows), intermediate_hidden, 64, 128, static_cast<int>(num_pool_rows), 128);
 
-    float* shared_dw1_ptr = nullptr;
-    float* shared_dw2_ptr = nullptr;
+    void* shared_dw1_ptr = nullptr;
+    void* shared_dw2_ptr = nullptr;
     if (shared_w1_weights != nullptr) {
-        shared_dw1_ptr = shared_dw1_weights->data_ptr<float>();
-        shared_dw2_ptr = shared_dw2_weights->data_ptr<float>();
+        shared_dw1_ptr = shared_dw1_weights->data_ptr();
+        shared_dw2_ptr = shared_dw2_weights->data_ptr();
     }
+    const std::string dw_type = dw1_weights.scalar_type() == torch::kBFloat16 ? "nv_bfloat16" : "float";
 
     const auto kernel = jit->compile("sm100_bf16_mega_moe_backward", std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe_backward.cuh>
@@ -95,7 +97,8 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {}
+        {},
+        {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -106,7 +109,8 @@ static void __instantiate_kernel() {{
         num_sms, num_ranks,
         to_string(activation_clamp),
         fast_math ? "true" : "false",
-        config.num_stages));
+        config.num_stages,
+        dw_type, dw_natural_layout ? "true" : "false"));
     jit->launch(
         kernel, {
             .num_smem_bytes = config.smem_size,
@@ -114,7 +118,7 @@ static void __instantiate_kernel() {{
             .block_dim = dim3(config.num_threads, 1, 1),
         },
         dx.data_ptr(),
-        dw1_weights.data_ptr<float>(), dw2_weights.data_ptr<float>(), dtopk_weights.data_ptr<float>(),
+        dw1_weights.data_ptr(), dw2_weights.data_ptr(), dtopk_weights.data_ptr<float>(),
         shared_dw1_ptr, shared_dw2_ptr,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),

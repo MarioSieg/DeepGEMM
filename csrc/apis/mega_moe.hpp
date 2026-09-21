@@ -416,7 +416,8 @@ static void bf16_mega_moe_backward(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& dw_natural_layout
 ) {
     const auto num_tokens = static_cast<int>(dy.size(0));
     DG_HOST_ASSERT(activation == "swiglu");
@@ -443,8 +444,8 @@ static void bf16_mega_moe_backward(
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
     DG_HOST_ASSERT(dx.is_contiguous() and dy.is_contiguous());
 
-    DG_HOST_ASSERT(dw1_weights.scalar_type() == torch::kFloat32);
-    DG_HOST_ASSERT(dw2_weights.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(dw1_weights.scalar_type() == torch::kFloat32 or dw1_weights.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(dw2_weights.scalar_type() == dw1_weights.scalar_type());
     DG_HOST_ASSERT(dw1_weights.sizes() == l1_weights.sizes());
     DG_HOST_ASSERT(dw2_weights.sizes() == l2_weights.sizes());
     DG_HOST_ASSERT(dw1_weights.is_contiguous() and dw2_weights.is_contiguous());
@@ -474,8 +475,8 @@ static void bf16_mega_moe_backward(
         DG_HOST_ASSERT(get_major_type_ab(shared_l1_weights) == cute::UMMA::Major::K);
         DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
 
-        DG_HOST_ASSERT(shared_dw1_weights.scalar_type() == torch::kFloat32);
-        DG_HOST_ASSERT(shared_dw2_weights.scalar_type() == torch::kFloat32);
+        DG_HOST_ASSERT(shared_dw1_weights.scalar_type() == dw1_weights.scalar_type());
+        DG_HOST_ASSERT(shared_dw2_weights.scalar_type() == dw1_weights.scalar_type());
         DG_HOST_ASSERT(shared_dw1_weights.sizes() == shared_l1_weights.sizes());
         DG_HOST_ASSERT(shared_dw2_weights.sizes() == shared_l2_weights.sizes());
         DG_HOST_ASSERT(shared_dw1_weights.is_contiguous() and shared_dw2_weights.is_contiguous());
@@ -530,7 +531,7 @@ static void bf16_mega_moe_backward(
                                      num_tokens, num_topk,
                                      hidden, intermediate_hidden,
                                      num_ring_tokens,
-                                     activation_clamp, fast_math);
+                                     activation_clamp, fast_math, dw_natural_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

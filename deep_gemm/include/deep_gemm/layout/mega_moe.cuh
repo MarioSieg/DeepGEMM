@@ -470,6 +470,7 @@ struct MegaMoEBackwardBuffer {
     static constexpr uint32_t kBlockM = 128;
     static constexpr uint32_t kNumStageSlots = 2;
     static constexpr uint32_t kMaxExpertSlots = 1024;
+    static constexpr uint32_t kNumZSlots = 256;
     Buffer input_dy_buffer;
     Buffer dx_slot_buffer;
     Buffer dtopk_weight_slot_buffer;
@@ -483,12 +484,19 @@ struct MegaMoEBackwardBuffer {
     uint32_t* expert_pool_base;
     uint32_t* expert_num_blocks;
     uint32_t* expert_done;
+    uint32_t* expert_a2_target;
+    uint32_t* num_routed_blocks;
+    uint32_t* block_a0_done;
+    uint32_t* block_a1_done;
+    uint32_t* block_a2_done;
+    float* block_dtopk;
+    float* meta_weight;
     void* x_pool;
     void* dy_pool;
     void* dz_pool;
     void* hw_pool;
     void* z_scratch;
-    uint64_t z_bytes_per_sm;
+    uint64_t z_bytes_per_slot;
     uint8_t* end;
     MegaMoEBackwardBuffer() = default;
     CUTLASS_HOST_DEVICE MegaMoEBackwardBuffer(void* base, const uint32_t& hidden, const uint32_t& intermediate_hidden, const uint32_t& num_max_tokens_per_rank, const uint32_t& num_topk, const uint32_t& num_shared_experts, const uint32_t& num_max_pool_tokens, const uint32_t& num_sms) {
@@ -507,16 +515,24 @@ struct MegaMoEBackwardBuffer {
         expert_pool_base = counters + 4;
         expert_num_blocks = expert_pool_base + kMaxExpertSlots;
         expert_done = expert_num_blocks + kMaxExpertSlots;
+        expert_a2_target = expert_done + kMaxExpertSlots;
+        num_routed_blocks = counters + 3;
+        block_a0_done = expert_a2_target + kMaxExpertSlots;
+        block_a1_done = block_a0_done + max_num_blocks;
+        block_a2_done = block_a1_done + max_num_blocks;
+        block_dtopk = reinterpret_cast<float*>(block_a2_done + max_num_blocks);
+        meta_weight = block_dtopk + static_cast<uint64_t>(max_num_blocks) * kBlockM;
         shared_region_stride = math::align<uint32_t>(num_max_tokens_per_rank, kBlockM);
         num_pool_rows = math::align<uint32_t>(num_max_pool_tokens, kBlockM) + kBlockM +
             (num_shared_experts > 0 ? num_shared_experts * shared_region_stride : 0u);
-        auto* ptr = reinterpret_cast<uint8_t*>(math::align<uint64_t>(reinterpret_cast<uint64_t>(expert_done + kMaxExpertSlots), 1024));
+        auto* ptr = reinterpret_cast<uint8_t*>(math::align<uint64_t>(reinterpret_cast<uint64_t>(meta_weight + num_max_pool_tokens), 1024));
         x_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * hidden * 2;
         dy_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * hidden * 2;
         dz_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * 2 * intermediate_hidden * 2;
         hw_pool = ptr; ptr += static_cast<uint64_t>(num_pool_rows) * intermediate_hidden * 2;
-        z_bytes_per_sm = static_cast<uint64_t>(2 * intermediate_hidden) * kBlockM * 4;
-        z_scratch = ptr; ptr += z_bytes_per_sm * num_sms;
+        const uint32_t num_passes = num_shared_experts > 0 ? num_shared_experts : 1u;
+        z_bytes_per_slot = static_cast<uint64_t>(num_passes) * 2 * intermediate_hidden * kBlockM * 4;
+        z_scratch = ptr; ptr += z_bytes_per_slot * kNumZSlots;
         end = ptr;
     }
     [[nodiscard]] CUTLASS_HOST_DEVICE void* get_end_ptr() const { return end; }
