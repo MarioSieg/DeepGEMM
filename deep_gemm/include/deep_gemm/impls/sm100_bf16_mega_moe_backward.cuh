@@ -122,7 +122,6 @@ sm100_bf16_mega_moe_backward_impl(
     constexpr uint32_t kNumDW2Tiles = (kHidden / DW_M)*kNumG2TilesWide;
     constexpr uint32_t kNumDW1Tiles = (I2 / DW_M)*kNumHTilesWide;
     constexpr uint32_t kHostStageBytes = (UMMA_M + UMMA_N)*BLOCK_K*sizeof(bf16_t);
-    constexpr uint32_t kNumPipeStages = (kNumStages*kHostStageBytes) / ((UMMA_M + UMMA_N_WIDE)*BLOCK_K*sizeof(bf16_t));
     constexpr uint32_t kNumPipeStages = (kNumStages*kHostStageBytes) / ((DW_M + UMMA_N_WIDE)*BLOCK_K*sizeof(bf16_t));
     constexpr uint32_t kNumTilesPerExpert = kNumDW2Tiles + kNumDW1Tiles;
     constexpr uint32_t kNumSharedSlots = kHasShared ? kNumPasses : 0;
@@ -254,8 +253,8 @@ sm100_bf16_mega_moe_backward_impl(
             }
             pool_base += kNumPasses*bw.shared_region_stride;
         }
-        SUPERMEOW_DEVICE_ASSERT(num_blocks <= bw.max_num_blocks);
-        SUPERMEOW_DEVICE_ASSERT(pool_base <= bw.num_pool_rows);
+        DG_DEVICE_ASSERT(num_blocks <= bw.max_num_blocks);
+        DG_DEVICE_ASSERT(pool_base <= bw.num_pool_rows);
         *bw.num_blocks = num_blocks;
         *bw.num_routed_blocks = num_routed_blocks;
         uint32_t num_items = kNumExpertSlots*kNumTilesPerExpert;
@@ -323,7 +322,6 @@ sm100_bf16_mega_moe_backward_impl(
         uint32_t zslot;
     };
     struct SharedStorage final {
-        alignas(1024) bf16_t a[kNumPipeStages][UMMA_M*BLOCK_K];
         alignas(1024) bf16_t a[kNumPipeStages][DW_M*BLOCK_K];
         alignas(1024) bf16_t b[kNumPipeStages][UMMA_N_WIDE*BLOCK_K];
         float route_weight[kNumSlots][BLOCK_M];
@@ -883,7 +881,7 @@ sm100_bf16_mega_moe_backward_impl(
                    prof_rank, sm_idx, clock64() - prof_t_main, p_full[kKindZ], p_full[kKindDz], p_full[kKindDx], p_full[kKindDw],
                    p_kb[kKindZ], p_kb[kKindDz], p_kb[kKindDx], p_kb[kKindDw], p_tempty, p_slotw);)
     } else if (warp >= 4) {
-        SUPERMEOW_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr) == 0);
+        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr) == 0);
         uint32_t epi_warp = warp - 4;
         uint32_t epi_tid = tid - 128;
         uint32_t row = epi_warp*32 + lane;
@@ -926,7 +924,7 @@ sm100_bf16_mega_moe_backward_impl(
             for (uint32_t i=0; i < 4; ++i)
                 dst4[i] = make_uint4(pack2(v[(i<<3) + 0], v[(i<<3) + 1]), pack2(v[(i<<3) + 2], v[(i<<3) + 3]), pack2(v[(i<<3) + 4], v[(i<<3) + 5]), pack2(v[(i<<3) + 6], v[(i<<3) + 7]));
         };
-        auto stage_store = [&](const float* v, auto& row_ptr) {
+        auto stage_store = [&](const float* v, const auto& row_ptr) {
             auto* stage = &smem.epi_stage[epi_warp][0][0];
             auto* mine = reinterpret_cast<uint4*>(stage + lane*(CHUNK + 8));
             #pragma unroll
@@ -1233,7 +1231,7 @@ sm100_bf16_mega_moe_backward_impl(
                prof_t_barrier_end - prof_t_roles_end, clock64() - prof_t_barrier_end, clock64() - prof_t_start);)
 #else
     if (blockIdx.x == 0 && threadIdx.x == 0)
-        SUPERMEOW_DEVICE_ASSERT(false && "This kernel only support sm_100f");
+        DG_DEVICE_ASSERT(false && "This kernel only support sm_100f");
 #endif
 }
 }
