@@ -17,6 +17,23 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
+#ifndef DG_MEGA_BWD_PROFILE
+#define DG_MEGA_BWD_PROFILE 0
+#endif
+#ifndef DG_MEGA_BWD_PROFILE_LAUNCH
+#define DG_MEGA_BWD_PROFILE_LAUNCH 4
+#endif
+#if DG_MEGA_BWD_PROFILE
+#define DG_PROF_DECL(...) unsigned long long __VA_ARGS__
+#define DG_PROF_TIME(acc, ...) do { const long long _dg_t0 = clock64(); __VA_ARGS__; (acc) += clock64() - _dg_t0; } while (0)
+#define DG_PROF(...) __VA_ARGS__
+__device__ uint32_t g_dg_mega_bwd_prof_launch = 0;
+#else
+#define DG_PROF_DECL(...)
+#define DG_PROF_TIME(acc, ...) __VA_ARGS__
+#define DG_PROF(...)
+#endif
+
 namespace deep_gemm {
 
 template<const bool kFastMath>
@@ -84,28 +101,38 @@ sm100_bf16_mega_moe_backward_impl(
     constexpr uint32_t BLOCK_K = 64;
     constexpr uint32_t CHUNK = 32;
     constexpr uint32_t kNumChunks = UMMA_N / CHUNK;
+    constexpr uint32_t UMMA_N_WIDE = 256;
+    constexpr uint32_t kNumChunksWide = UMMA_N_WIDE / CHUNK;
     constexpr uint32_t kNumGatherChunks = BLOCK_M / CHUNK;
     constexpr uint32_t kNumEpilogueThreads = 128;
     constexpr uint32_t kEpilogueBarrierIdx = 1;
-    constexpr uint32_t kNumAccumStages = 4;
-    constexpr uint32_t kNumTmemCols = kNumAccumStages*UMMA_N;
+    constexpr uint32_t kAccumCols = UMMA_N_WIDE;
+    constexpr uint32_t kNumAccumStages = 2;
+    constexpr uint32_t kNumTmemCols = kNumAccumStages*kAccumCols;
     constexpr uint32_t I2 = kIntermediateHidden<<1;
     constexpr uint32_t kNumG1Tiles = I2 / UMMA_M;
     constexpr uint32_t kNumG2Tiles = kIntermediateHidden / UMMA_M;
     constexpr uint32_t kNumHTiles = kHidden / UMMA_M;
     constexpr uint32_t kNumKBlocksH = kHidden / BLOCK_K;
     constexpr uint32_t kNumKBlocksI2 = I2 / BLOCK_K;
-    constexpr uint32_t kNumDW2Tiles = kNumHTiles*kNumG2Tiles;
-    constexpr uint32_t kNumDW1Tiles = kNumG1Tiles*kNumHTiles;
+    constexpr uint32_t kNumHTilesWide = kHidden / UMMA_N_WIDE;
+    constexpr uint32_t kNumG2TilesWide = kIntermediateHidden / UMMA_N_WIDE;
+    constexpr uint32_t kNumDxTiles = kNumHTilesWide;
+    constexpr uint32_t kNumDW2Tiles = kNumHTiles*kNumG2TilesWide;
+    constexpr uint32_t kNumDW1Tiles = kNumG1Tiles*kNumHTilesWide;
+    constexpr uint32_t kHostStageBytes = (UMMA_M + UMMA_N)*BLOCK_K*sizeof(bf16_t);
+    constexpr uint32_t kNumPipeStages = (kNumStages*kHostStageBytes) / ((UMMA_M + UMMA_N_WIDE)*BLOCK_K*sizeof(bf16_t));
     constexpr uint32_t kNumTilesPerExpert = kNumDW2Tiles + kNumDW1Tiles;
     constexpr uint32_t kNumSharedSlots = kHasShared ? kNumPasses : 0;
     constexpr uint32_t kNumExpertSlots = kNumExpertsPerRank + kNumSharedSlots;
-    constexpr uint32_t kDxStageStride = CHUNK + 8;
     constexpr uint32_t kNumVecPerRow = (kHidden<<1)>>4;
     constexpr uint32_t kVecPerLane = kNumVecPerRow>>5;
     constexpr uint32_t kVecUnroll = (7&kVecPerLane) == 0 ? 8 : (3&kVecPerLane) == 0 ? 4 : (1&kVecPerLane) == 0 ? 2 : 1;
     constexpr uint32_t kKindGather = 0, kKindZ = 1, kKindDz = 2, kKindDx = 3, kKindDw = 4;
     constexpr uint32_t kGroupBlocks = 32;
+    constexpr uint32_t kNumSlots = 4;
+    constexpr uint32_t kMetaTokenBits = 20, kMetaRankBits = 6;
+    static_assert(kNumMaxTokensPerRank <= (1u << kMetaTokenBits) && kNumRanks <= 64 && kNumTopk < 64, "Invalid metadata packing");
     static_assert(kNumZSlots % kGroupBlocks == 0, "Invalid group size");
 
     static_assert(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
@@ -117,7 +144,8 @@ sm100_bf16_mega_moe_backward_impl(
     static_assert((31&kNumVecPerRow) == 0, "Invalid hidden for the gather");
     static_assert(kNumTmemCols <= 512, "Invalid TMEM usage");
     static_assert(kNumExpertSlots <= layout::MegaMoEBackwardBuffer::kMaxExpertSlots, "Too many experts per rank");
-    static_assert(kNumStages >= 2, "Invalid number of stages");
+    static_assert(kNumPipeStages >= 2, "Invalid number of stages");
+    static_assert(kHidden % UMMA_N_WIDE == 0 && kIntermediateHidden % UMMA_N_WIDE == 0, "Wide tiles need hidden sizes divisible by 256");
 
     const uint32_t tid = threadIdx.x;
     const uint32_t sm_idx = blockIdx.x;
@@ -125,6 +153,8 @@ sm100_bf16_mega_moe_backward_impl(
     const uint32_t lane = tid&31;
     constexpr uint32_t kNumGlobalThreads = kNumSMs*kNumThreads;
     const uint32_t global_tid = sm_idx*kNumThreads + tid;
+    DG_PROF(const long long prof_t_start = clock64();
+            const uint32_t prof_launch = *reinterpret_cast<volatile uint32_t*>(&g_dg_mega_bwd_prof_launch);)
 
     if (warp == 0) {
         cute::prefetch_tma_descriptor(&tensor_map_w1_k);
@@ -161,7 +191,7 @@ sm100_bf16_mega_moe_backward_impl(
     auto* dy_pool = static_cast<nv_bfloat16*>(bw.dy_pool);
     auto* dz_pool = static_cast<nv_bfloat16*>(bw.dz_pool);
     auto* hw_pool = static_cast<nv_bfloat16*>(bw.hw_pool);
-    auto* z_scratch = static_cast<float*>(bw.z_scratch);
+    auto* z_scratch = static_cast<nv_bfloat16*>(bw.z_scratch);
     const uint64_t pool_stride = bw.num_pool_rows;
 
     for (uint32_t i = global_tid; i < kNumExperts; i += kNumGlobalThreads)
@@ -238,7 +268,7 @@ sm100_bf16_mega_moe_backward_impl(
         for (uint32_t b0 = 0; b0 < num_blocks; b0 += kGroupBlocks) {
             const uint32_t nb = cute::min(kGroupBlocks, num_blocks - b0);
             const uint32_t r = num_routed_blocks > b0 ? cute::min(nb, num_routed_blocks - b0) : 0u;
-            num_items += nb*kNumGatherChunks + (r + (nb - r)*kNumPasses)*(kNumG1Tiles + kNumG2Tiles) + nb*kNumHTiles;
+            num_items += nb*kNumGatherChunks + (r + (nb - r)*kNumPasses)*(kNumG1Tiles + kNumG2Tiles) + nb*kNumDxTiles;
         }
         *bw.num_items = num_items;
         *bw.next_item=0;
@@ -300,24 +330,22 @@ sm100_bf16_mega_moe_backward_impl(
         uint32_t zslot;
     };
     struct SharedStorage {
-        alignas(1024) bf16_t a[kNumStages][UMMA_M*BLOCK_K];
-        alignas(1024) bf16_t b[kNumStages][UMMA_N*BLOCK_K];
-        float route_weight[2][BLOCK_M];
-        uint32_t src_rank[2][BLOCK_M];
-        uint32_t src_token[2][BLOCK_M];
-        uint32_t src_topk[2][BLOCK_M];
-        Item item[2];
-        uint32_t item_valid[2];
+        alignas(1024) bf16_t a[kNumPipeStages][UMMA_M*BLOCK_K];
+        alignas(1024) bf16_t b[kNumPipeStages][UMMA_N_WIDE*BLOCK_K];
+        float route_weight[kNumSlots][BLOCK_M];
+        uint32_t src_meta[kNumSlots][BLOCK_M];
+        Item item[kNumSlots];
+        uint32_t item_valid[kNumSlots];
         uint32_t g_block[2], g_pool_begin[2], g_valid_m[2], g_row_begin[2], g_valid[2];
         uint32_t g_src_rank[2][CHUNK];
         uint32_t g_src_token[2][CHUNK];
         Barrier gfull[2];
         Barrier gempty[2];
-        alignas(16) bf16_t dx_stage[4][CHUNK][kDxStageStride];
-        Barrier slot_full[2];
-        Barrier slot_empty[2];
-        Barrier full[kNumStages];
-        Barrier empty[kNumStages];
+        alignas(16) bf16_t epi_stage[4][CHUNK][CHUNK + 8];
+        Barrier slot_full[kNumSlots];
+        Barrier slot_empty[kNumSlots];
+        Barrier full[kNumPipeStages];
+        Barrier empty[kNumPipeStages];
         Barrier tmem_full[kNumAccumStages];
         Barrier tmem_empty[kNumAccumStages];
         uint32_t tmem_ptr;
@@ -326,18 +354,25 @@ sm100_bf16_mega_moe_backward_impl(
     auto& smem = *reinterpret_cast<SharedStorage*>(smem_raw);
     constexpr uint32_t kStageABytes = sizeof(smem.a[0]);
     constexpr uint32_t kStageBBytes = sizeof(smem.b[0]);
+    static_assert(sizeof(SharedStorage) <= kNumStages*kHostStageBytes + 16384, "Shared storage exceeds the host allocation");
+    const auto meta_token = [&](const uint32_t& slot, const uint32_t& r) { return smem.src_meta[slot][r] & ((1u << kMetaTokenBits) - 1); };
+    const auto meta_rank = [&](const uint32_t& slot, const uint32_t& r) { return (smem.src_meta[slot][r] >> kMetaTokenBits) & ((1u << kMetaRankBits) - 1); };
+    const auto meta_topk = [&](const uint32_t& slot, const uint32_t& r) { return smem.src_meta[slot][r] >> (kMetaTokenBits + kMetaRankBits); };
 
     if (warp == 1) {
         if (cute::elect_one_sync()) {
             #pragma unroll
-            for (uint32_t i=0; i < 2; ++i) {
+            for (uint32_t i=0; i < kNumSlots; ++i) {
                 smem.slot_full[i].init(1);
                 smem.slot_empty[i].init(1);
+            }
+            #pragma unroll
+            for (uint32_t i=0; i < 2; ++i) {
                 smem.gfull[i].init(1);
                 smem.gempty[i].init(1);
             }
             #pragma unroll
-            for (uint32_t i=0; i < kNumStages; ++i) {
+            for (uint32_t i=0; i < kNumPipeStages; ++i) {
                 smem.full[i].init(1);
                 smem.empty[i].init(1);
             }
@@ -356,7 +391,7 @@ sm100_bf16_mega_moe_backward_impl(
     const auto pg = [](const uint32_t& j) -> uint32_t {
         return (j / kGran)*2*kGran + (j % kGran);
     };
-    const auto z_slot_ptr = [&](const uint32_t& zslot, const uint32_t& pass) -> float* {
+    const auto z_slot_ptr = [&](const uint32_t& zslot, const uint32_t& pass) -> nv_bfloat16* {
         return z_scratch + (static_cast<uint64_t>(zslot)*kNumPasses + pass)*I2*BLOCK_M;
     };
     const auto block_passes = [&](const uint32_t& block) -> uint32_t {
@@ -409,9 +444,13 @@ sm100_bf16_mega_moe_backward_impl(
             __nanosleep(128);
     };
 
+    DG_PROF(const long long prof_t_main = clock64();
+            const bool prof_print = prof_launch == DG_MEGA_BWD_PROFILE_LAUNCH;
+            const uint32_t prof_rank = sym_buffer.rank_idx;)
     if (warp == 0) {
         uint32_t slot = 0, slot_phase = 0;
         uint32_t gslot = 0, gphase = 0;
+        DG_PROF_DECL(p_dep[5] = {0, 0, 0, 0, 0}, p_n[5] = {0, 0, 0, 0, 0}, p_slot = 0, p_gempty = 0);
         for (;;) {
             uint32_t item_idx = 0;
             if (lane == 0)
@@ -430,7 +469,7 @@ sm100_bf16_mega_moe_backward_impl(
                         r_ = num_routed_blocks > b0_ ? cute::min(nb_, num_routed_blocks - b0_) : 0u;
                     };
                     const auto gather_count = [&](const uint32_t& nb_) { return nb_*kNumGatherChunks; };
-                    const auto compute_count = [&](const uint32_t& nb_, const uint32_t& r_) { return (r_ + (nb_ - r_)*kNumPasses)*(kNumG1Tiles + kNumG2Tiles) + nb_*kNumHTiles; };
+                    const auto compute_count = [&](const uint32_t& nb_, const uint32_t& r_) { return (r_ + (nb_ - r_)*kNumPasses)*(kNumG1Tiles + kNumG2Tiles) + nb_*kNumDxTiles; };
                     uint32_t rem = item_idx, b0 = 0, nb = 0, r = 0;
                     bool is_gather = false;
                     group_of(0, b0, nb, r);
@@ -480,8 +519,8 @@ sm100_bf16_mega_moe_backward_impl(
                     } else {
                         rem -= (r + (nb - r)*kNumPasses)*kNumG2Tiles;
                         cur.kind = kKindDx;
-                        cur.block = b0 + rem / kNumHTiles;
-                        cur.tile = rem % kNumHTiles;
+                        cur.block = b0 + rem / kNumDxTiles;
+                        cur.tile = rem % kNumDxTiles;
                         cur.num_k_blocks = block_passes(cur.block)*kNumKBlocksI2;
                     }
                     const uint32_t num_passes = block_passes(cur.block);
@@ -492,7 +531,8 @@ sm100_bf16_mega_moe_backward_impl(
                     cur.valid_m = bd.valid_m;
                     cur.zslot = cur.block % kNumZSlots;
                     if (cur.kind == kKindGather) {
-                        smem.gempty[gslot].wait(gphase ^ 1);
+                        DG_PROF_TIME(p_gempty, smem.gempty[gslot].wait(gphase ^ 1));
+                        DG_PROF(++p_n[kKindGather];)
                         const bool is_shared = cur.expert >= kNumExpertsPerRank;
                         const uint32_t r = cur.tile*CHUNK + lane;
                         uint32_t src_rank = sym_buffer.rank_idx, src_token = 0;
@@ -517,11 +557,12 @@ sm100_bf16_mega_moe_backward_impl(
                         __syncwarp();
                         if (lane == 0)
                             smem.gfull[gslot].arrive();
-                        gslot ^= 1;
-                        gphase ^= (gslot == 0);
+                        gslot^=1;
+                        gphase^=(gslot == 0);
                         continue;
                     }
                     if (lane == 0) {
+                        DG_PROF(const long long _dg_t0 = clock64();)
                         if (cur.kind == kKindZ) {
                             wait_counter(bw.block_a0_done + cur.block, kNumGatherChunks);
                             if (cur.block >= kNumZSlots)
@@ -531,6 +572,7 @@ sm100_bf16_mega_moe_backward_impl(
                         } else if (cur.kind == kKindDx) {
                             wait_counter(bw.block_a2_done + cur.block, num_passes*kNumG2Tiles);
                         }
+                        DG_PROF(p_dep[cur.kind] += clock64() - _dg_t0; ++p_n[cur.kind];)
                     }
                 } else {
                     const uint32_t t = item_idx - num_block_items;
@@ -541,13 +583,15 @@ sm100_bf16_mega_moe_backward_impl(
                     cur.pool_begin = bw.expert_pool_base[cur.expert];
                     cur.x_begin = bw.expert_pool_base[cur.expert < kNumExpertsPerRank ? cur.expert : kNumExpertsPerRank];
                     const uint32_t done_slot = cur.expert < kNumExpertsPerRank ? cur.expert : kNumExpertsPerRank;
-                    if (lane == 0)
-                        wait_counter(bw.expert_done + done_slot, bw.expert_a2_target[done_slot]);
+                    if (lane == 0) {
+                        DG_PROF_TIME(p_dep[kKindDw], wait_counter(bw.expert_done + done_slot, bw.expert_a2_target[done_slot]));
+                        DG_PROF(++p_n[kKindDw];)
+                    }
                 }
                 __syncwarp();
                 fence_proxy_async_global();
             }
-            smem.slot_empty[slot].wait(slot_phase ^ 1);
+            DG_PROF_TIME(p_slot, smem.slot_empty[slot].wait(slot_phase ^ 1));
             if (!done && cur.kind != kKindDw) {
                 const auto bd = bw.block_desc[cur.block];
                     const bool is_shared = cur.expert >= kNumExpertsPerRank;
@@ -567,9 +611,7 @@ sm100_bf16_mega_moe_backward_impl(
                             }
                         }
                         smem.route_weight[slot][r] = weight;
-                        smem.src_rank[slot][r] = src_rank;
-                        smem.src_token[slot][r] = src_token;
-                        smem.src_topk[slot][r] = src_topk;
+                        smem.src_meta[slot][r] = src_token | (src_rank << kMetaTokenBits) | (src_topk << (kMetaTokenBits + kMetaRankBits));
                     }
             }
             if (lane == 0) {
@@ -588,39 +630,50 @@ sm100_bf16_mega_moe_backward_impl(
                     smem.gfull[gslot].arrive();
                 break;
             }
-            slot ^= 1;
-            slot_phase ^= (slot == 0);
+            slot = (slot + 1) % kNumSlots;
+            slot_phase^=(slot == 0);
         }
+        DG_PROF(if (prof_print && lane == 0) {
+            printf("DGPROF r=%u sm=%u role=sched total=%lld dep_z=%llu dep_dz=%llu dep_dx=%llu dep_dw=%llu n_g=%llu n_z=%llu n_dz=%llu n_dx=%llu n_dw=%llu slot_wait=%llu gempty_wait=%llu\n",
+                   prof_rank, sm_idx, clock64() - prof_t_main, p_dep[kKindZ], p_dep[kKindDz], p_dep[kKindDx], p_dep[kKindDw],
+                   p_n[kKindGather], p_n[kKindZ], p_n[kKindDz], p_n[kKindDx], p_n[kKindDw], p_slot, p_gempty);
+        })
     } else if (warp == 3) {
         uint32_t gslot = 0, gphase = 0;
+        DG_PROF_DECL(p_gwait = 0, p_gwork = 0);
         for (;;) {
-            smem.gfull[gslot].wait(gphase);
+            DG_PROF_TIME(p_gwait, smem.gfull[gslot].wait(gphase));
             if (!smem.g_valid[gslot])
                 break;
-            gather_rows(gslot, smem.g_pool_begin[gslot], smem.g_valid_m[gslot], smem.g_row_begin[gslot]);
+            DG_PROF_TIME(p_gwork, gather_rows(gslot, smem.g_pool_begin[gslot], smem.g_valid_m[gslot], smem.g_row_begin[gslot]));
             __threadfence();
             __syncwarp();
             if (lane == 0) {
                 ptx::atomic_add_rel(bw.block_a0_done + smem.g_block[gslot], 1u);
                 smem.gempty[gslot].arrive();
             }
-            gslot ^= 1;
-            gphase ^= (gslot == 0);
+            gslot^=1;
+            gphase^=(gslot == 0);
         }
+        DG_PROF(if (prof_print && lane == 0)
+            printf("DGPROF r=%u sm=%u role=gather total=%lld wait=%llu work=%llu\n", prof_rank, sm_idx, clock64() - prof_t_main, p_gwait, p_gwork);)
     } else if (warp == 1) {
         uint32_t stage = 0, phase = 0;
         uint32_t slot = 0, slot_phase = 0;
         const auto advance = [&]() {
-            stage = (stage + 1) % kNumStages;
-            phase ^= (stage == 0);
+            stage = (stage + 1) % kNumPipeStages;
+            phase^=(stage == 0);
         };
         const auto issue = [&](const uint32_t& num_bytes) {
             smem.full[stage].arrive_and_expect_tx(num_bytes);
             advance();
         };
         constexpr uint32_t kStageBytes = UMMA_M*BLOCK_K*2 + UMMA_N*BLOCK_K*2;
+        constexpr uint32_t kStageBytesWide = UMMA_M*BLOCK_K*2 + UMMA_N_WIDE*BLOCK_K*2;
+        constexpr uint32_t kBHalf = UMMA_N*BLOCK_K;
+        DG_PROF_DECL(p_empty = 0, p_slotw = 0);
         for (;;) {
-            smem.slot_full[slot].wait(slot_phase);
+            DG_PROF_TIME(p_slotw, smem.slot_full[slot].wait(slot_phase));
             if (!smem.item_valid[slot])
                 break;
             const auto item = smem.item[slot];
@@ -631,7 +684,7 @@ sm100_bf16_mega_moe_backward_impl(
             if (item.kind == kKindZ) {
                 const uint32_t w1_rows = is_shared ? item.pass*I2 : item.expert*I2;
                 for (uint32_t kb = 0; kb < kNumKBlocksH; ++kb) {
-                    smem.empty[stage].wait(phase ^ 1);
+                    DG_PROF_TIME(p_empty, smem.empty[stage].wait(phase ^ 1));
                     if (cute::elect_one_sync()) {
                         tma::copy<BLOCK_K, UMMA_M, 128, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb*BLOCK_K, w1_rows + item.tile*UMMA_M);
                         tma::copy<BLOCK_K, UMMA_N, 128, bf16_t>(&tensor_map_x_k, &smem.full[stage], smem.b[stage], kb*BLOCK_K, item.pool_begin);
@@ -645,7 +698,7 @@ sm100_bf16_mega_moe_backward_impl(
                 const uint32_t w2_rows = is_shared ? 0u : item.expert*kHidden;
                 const uint32_t w2_cols = is_shared ? item.pass*kIntermediateHidden : 0u;
                 for (uint32_t kb = 0; kb < kNumKBlocksH; ++kb) {
-                    smem.empty[stage].wait(phase ^ 1);
+                    DG_PROF_TIME(p_empty, smem.empty[stage].wait(phase ^ 1));
                     if (cute::elect_one_sync()) {
                         tma::copy<UMMA_M, BLOCK_K, 128, bf16_t>(w2mn, &smem.full[stage], smem.a[stage], w2_cols + item.tile*UMMA_M, w2_rows + kb*BLOCK_K);
                         tma::copy<BLOCK_K, UMMA_N, 128, bf16_t>(&tensor_map_dy_k, &smem.full[stage], smem.b[stage], kb*BLOCK_K, item.pool_begin);
@@ -658,12 +711,15 @@ sm100_bf16_mega_moe_backward_impl(
             } else if (item.kind == kKindDx) {
                 const uint32_t w1_rows = is_shared ? 0u : item.expert*I2;
                 for (uint32_t kb = 0; kb < item.num_k_blocks; ++kb) {
-                    smem.empty[stage].wait(phase ^ 1);
+                    DG_PROF_TIME(p_empty, smem.empty[stage].wait(phase ^ 1));
                     if (cute::elect_one_sync()) {
-                        tma::copy<UMMA_M, BLOCK_K, 128, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile*UMMA_M, w1_rows + kb*BLOCK_K);
-                        tma::copy<UMMA_N, BLOCK_K, 128, bf16_t>(&tensor_map_dz_mn, &smem.full[stage], smem.b[stage],
+                        tma::copy<UMMA_M, BLOCK_K, 128, bf16_t>(&tensor_map_dz_mn, &smem.full[stage], smem.a[stage],
                                                                 item.pool_begin + (kb / kNumKBlocksI2)*bw.shared_region_stride, (kb % kNumKBlocksI2)*BLOCK_K);
-                        issue(kStageBytes);
+                        #pragma unroll
+                        for (uint32_t h = 0; h < 2; ++h)
+                            tma::copy<UMMA_N, BLOCK_K, 128, bf16_t>(w1mn, &smem.full[stage], smem.b[stage] + h*kBHalf,
+                                                                    item.tile*UMMA_N_WIDE + h*UMMA_N, w1_rows + kb*BLOCK_K);
+                        issue(kStageBytesWide);
                     } else {
                         advance();
                     }
@@ -671,41 +727,53 @@ sm100_bf16_mega_moe_backward_impl(
                 }
             } else if (item.kind == kKindDw) {
                 const bool is_dw2 = item.tile < kNumDW2Tiles;
-                const uint32_t mt = is_dw2 ? item.tile / kNumG2Tiles : (item.tile - kNumDW2Tiles) / kNumHTiles;
-                const uint32_t nt = is_dw2 ? item.tile % kNumG2Tiles : (item.tile - kNumDW2Tiles) % kNumHTiles;
+                const uint32_t mt = is_dw2 ? item.tile / kNumG2TilesWide : (item.tile - kNumDW2Tiles) / kNumHTilesWide;
+                const uint32_t nt = is_dw2 ? item.tile % kNumG2TilesWide : (item.tile - kNumDW2Tiles) % kNumHTilesWide;
                 for (uint32_t kb = 0; kb < item.num_k_blocks; ++kb) {
-                    smem.empty[stage].wait(phase ^ 1);
+                    DG_PROF_TIME(p_empty, smem.empty[stage].wait(phase ^ 1));
                     if (cute::elect_one_sync()) {
                         if (is_dw2) {
                             tma::copy<UMMA_M, BLOCK_K, 128, bf16_t>(&tensor_map_dy_mn, &smem.full[stage], smem.a[stage], mt*UMMA_M, item.x_begin + kb*BLOCK_K);
-                            tma::copy<BLOCK_K, UMMA_N, 128, bf16_t>(&tensor_map_hw_k, &smem.full[stage], smem.b[stage], item.pool_begin + kb*BLOCK_K, nt*UMMA_N);
+                            #pragma unroll
+                            for (uint32_t h = 0; h < 2; ++h)
+                                tma::copy<BLOCK_K, UMMA_N, 128, bf16_t>(&tensor_map_hw_k, &smem.full[stage], smem.b[stage] + h*kBHalf,
+                                                                        item.pool_begin + kb*BLOCK_K, nt*UMMA_N_WIDE + h*UMMA_N);
                         } else {
                             tma::copy<BLOCK_K, UMMA_M, 128, bf16_t>(&tensor_map_dz_k, &smem.full[stage], smem.a[stage], item.pool_begin + kb*BLOCK_K, mt*UMMA_M);
-                            tma::copy<UMMA_N, BLOCK_K, 128, bf16_t>(&tensor_map_x_mn, &smem.full[stage], smem.b[stage], nt*UMMA_N, item.x_begin + kb*BLOCK_K);
+                            #pragma unroll
+                            for (uint32_t h = 0; h < 2; ++h)
+                                tma::copy<UMMA_N, BLOCK_K, 128, bf16_t>(&tensor_map_x_mn, &smem.full[stage], smem.b[stage] + h*kBHalf,
+                                                                        nt*UMMA_N_WIDE + h*UMMA_N, item.x_begin + kb*BLOCK_K);
                         }
-                        issue(kStageBytes);
+                        issue(kStageBytesWide);
                     } else {
                         advance();
                     }
                     __syncwarp();
                 }
             }
-            slot ^= 1;
-            slot_phase ^= (slot == 0);
+            slot = (slot + 1) % kNumSlots;
+            slot_phase^=(slot == 0);
         }
+        DG_PROF(if (prof_print && lane == 0)
+            printf("DGPROF r=%u sm=%u role=tma total=%lld empty_wait=%llu slot_wait=%llu\n", prof_rank, sm_idx, clock64() - prof_t_main, p_empty, p_slotw);)
     } else if (warp == 2) {
         uint32_t stage = 0, phase = 0;
         uint32_t slot = 0, slot_phase = 0;
         uint32_t task_idx = 0;
+        DG_PROF_DECL(p_full[5] = {0, 0, 0, 0, 0}, p_tempty = 0, p_slotw = 0, p_kb[5] = {0, 0, 0, 0, 0});
+        DG_PROF(uint32_t prof_kind = 0;)
         const auto advance = [&]() {
-            stage = (stage + 1) % kNumStages;
-            phase ^= (stage == 0);
+            stage = (stage + 1) % kNumPipeStages;
+            phase^=(stage == 0);
         };
 
         const auto idesc_kk = cute::UMMA::make_instr_desc<bf16_t, bf16_t, float, UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
         const auto idesc_mk = cute::UMMA::make_instr_desc<bf16_t, bf16_t, float, UMMA_M, UMMA_N, cute::UMMA::Major::MN, cute::UMMA::Major::K>();
         const auto idesc_km = cute::UMMA::make_instr_desc<bf16_t, bf16_t, float, UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::MN>();
-        const auto idesc_mm = cute::UMMA::make_instr_desc<bf16_t, bf16_t, float, UMMA_M, UMMA_N, cute::UMMA::Major::MN, cute::UMMA::Major::MN>();
+        const auto idesc_mk_w = cute::UMMA::make_instr_desc<bf16_t, bf16_t, float, UMMA_M, UMMA_N_WIDE, cute::UMMA::Major::MN, cute::UMMA::Major::K>();
+        const auto idesc_km_w = cute::UMMA::make_instr_desc<bf16_t, bf16_t, float, UMMA_M, UMMA_N_WIDE, cute::UMMA::Major::K, cute::UMMA::Major::MN>();
+        const auto idesc_mm_w = cute::UMMA::make_instr_desc<bf16_t, bf16_t, float, UMMA_M, UMMA_N_WIDE, cute::UMMA::Major::MN, cute::UMMA::Major::MN>();
 
         auto a_k = mma::sm100::make_umma_desc<cute::UMMA::Major::K, UMMA_M, BLOCK_K, 128>(smem.a[0], 0, 0);
         auto a_mn = mma::sm100::make_umma_desc<cute::UMMA::Major::MN, UMMA_M, BLOCK_K, 128>(smem.a[0], 0, 0);
@@ -720,11 +788,12 @@ sm100_bf16_mega_moe_backward_impl(
             const auto accum = task_idx % kNumAccumStages;
             const auto accum_phase = (task_idx / kNumAccumStages) & 1;
             ++task_idx;
-            smem.tmem_empty[accum].wait(accum_phase ^ 1);
+            DG_PROF_TIME(p_tempty, smem.tmem_empty[accum].wait(accum_phase ^ 1));
             ptx::tcgen05_after_thread_sync();
             const auto runtime_idesc = cute::UMMA::make_runtime_instr_desc(idesc);
             for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
-                smem.full[stage].wait(phase);
+                DG_PROF_TIME(p_full[prof_kind], smem.full[stage].wait(phase));
+                DG_PROF(++p_kb[prof_kind];)
                 ptx::tcgen05_after_thread_sync();
                 const uint32_t a_base = a_lo + stage*(kStageABytes / 16);
                 const uint32_t b_base = b_lo + stage*(kStageBBytes / 16);
@@ -733,7 +802,7 @@ sm100_bf16_mega_moe_backward_impl(
                     for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++k) {
                         a_desc.lo = advance_a(a_base, k*UMMA_K);
                         b_desc.lo = advance_b(b_base, k*UMMA_K);
-                        ptx::SM100_MMA_F16BF16_SS::fma(a_desc, b_desc, accum*UMMA_N, kb > 0 || k > 0, runtime_idesc);
+                        ptx::SM100_MMA_F16BF16_SS::fma(a_desc, b_desc, accum*kAccumCols, kb > 0 || k > 0, runtime_idesc);
                     }
                 }
                 __syncwarp();
@@ -755,25 +824,30 @@ sm100_bf16_mega_moe_backward_impl(
         const auto adv_b_mn = [](const uint32_t& base, const uint32_t& k) -> uint32_t { return mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::MN, UMMA_N, 128, bf16_t>(base, 0, k); };
 
         for (;;) {
-            smem.slot_full[slot].wait(slot_phase);
+            DG_PROF_TIME(p_slotw, smem.slot_full[slot].wait(slot_phase));
             if (!smem.item_valid[slot])
                 break;
             const auto item = smem.item[slot];
+            DG_PROF(prof_kind = item.kind;)
             if (item.kind == kKindZ) {
                 run_task(a_k, b_k, a_k_lo, b_k_lo, adv_a_k, adv_b_k, idesc_kk, kNumKBlocksH);
             } else if (item.kind == kKindDz) {
                 run_task(a_mn, b_k, a_mn_lo, b_k_lo, adv_a_mn, adv_b_k, idesc_mk, kNumKBlocksH);
             } else if (item.kind == kKindDx) {
-                run_task(a_mn, b_mn, a_mn_lo, b_mn_lo, adv_a_mn, adv_b_mn, idesc_mm, item.num_k_blocks);
+                run_task(a_mn, b_mn, a_mn_lo, b_mn_lo, adv_a_mn, adv_b_mn, idesc_mm_w, item.num_k_blocks);
             } else if (item.kind == kKindDw) {
                 if (item.tile < kNumDW2Tiles)
-                    run_task(a_mn, b_k, a_mn_lo, b_k_lo, adv_a_mn, adv_b_k, idesc_mk, item.num_k_blocks);
+                    run_task(a_mn, b_k, a_mn_lo, b_k_lo, adv_a_mn, adv_b_k, idesc_mk_w, item.num_k_blocks);
                 else
-                    run_task(a_k, b_mn, a_k_lo, b_mn_lo, adv_a_k, adv_b_mn, idesc_km, item.num_k_blocks);
+                    run_task(a_k, b_mn, a_k_lo, b_mn_lo, adv_a_k, adv_b_mn, idesc_km_w, item.num_k_blocks);
             }
-            slot ^= 1;
-            slot_phase ^= (slot == 0);
+            slot = (slot + 1) % kNumSlots;
+            slot_phase^=(slot == 0);
         }
+        DG_PROF(if (prof_print && lane == 0)
+            printf("DGPROF r=%u sm=%u role=mma total=%lld full_z=%llu full_dz=%llu full_dx=%llu full_dw=%llu kb_z=%llu kb_dz=%llu kb_dx=%llu kb_dw=%llu tmem_empty_wait=%llu slot_wait=%llu\n",
+                   prof_rank, sm_idx, clock64() - prof_t_main, p_full[kKindZ], p_full[kKindDz], p_full[kKindDx], p_full[kKindDw],
+                   p_kb[kKindZ], p_kb[kKindDz], p_kb[kKindDx], p_kb[kKindDw], p_tempty, p_slotw);)
     } else if (warp >= 4) {
         DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(&smem.tmem_ptr) == 0);
         const uint32_t epi_warp = warp - 4;
@@ -781,17 +855,27 @@ sm100_bf16_mega_moe_backward_impl(
         const uint32_t row = epi_warp*32 + lane;
         uint32_t slot = 0, slot_phase = 0;
         uint32_t task_idx = 0;
+        DG_PROF_DECL(p_tfull[5] = {0, 0, 0, 0, 0}, p_item[5] = {0, 0, 0, 0, 0}, p_slotw = 0, p_seg[3][4] = {});
+        DG_PROF(long long prof_seg_t = 0;)
+#if DG_MEGA_BWD_PROFILE
+#define DG_PROF_SEG_BEGIN() (prof_seg_t = clock64())
+#define DG_PROF_SEG(k, idx) do { const long long _n = clock64(); p_seg[k][idx] += _n - prof_seg_t; prof_seg_t = _n; } while (0)
+#else
+#define DG_PROF_SEG_BEGIN() ((void)0)
+#define DG_PROF_SEG(k, idx) ((void)0)
+#endif
+        DG_PROF(uint32_t prof_kind = 0;)
 
         const auto epi_sync = [&]() { cutlass::arch::NamedBarrier::sync(kNumEpilogueThreads, kEpilogueBarrierIdx); };
         const auto begin_task = [&](uint32_t& accum) {
             accum = task_idx % kNumAccumStages;
             const auto accum_phase = (task_idx / kNumAccumStages) & 1;
             ++task_idx;
-            smem.tmem_full[accum].wait(accum_phase);
+            DG_PROF_TIME(p_tfull[prof_kind], smem.tmem_full[accum].wait(accum_phase));
             ptx::tcgen05_after_thread_sync();
         };
         const auto load_cols = [&](const uint32_t& accum, const uint32_t& col, float* v) {
-            ptx::tmem_load_32dp32b<32>(accum*UMMA_N + col, reinterpret_cast<uint32_t*>(v));
+            ptx::tmem_load_32dp32b<32>(accum*kAccumCols + col, reinterpret_cast<uint32_t*>(v));
             cutlass::arch::fence_view_async_tmem_load();
         };
         const auto release_tmem = [&](const uint32_t& accum) {
@@ -809,18 +893,40 @@ sm100_bf16_mega_moe_backward_impl(
                 dst4[i] = make_uint4(pack2(v[i*8 + 0], v[i*8 + 1]), pack2(v[i*8 + 2], v[i*8 + 3]),
                                      pack2(v[i*8 + 4], v[i*8 + 5]), pack2(v[i*8 + 6], v[i*8 + 7]));
         };
+        const auto stage_store = [&](const float* v, const auto& row_ptr) {
+            auto* stage = &smem.epi_stage[epi_warp][0][0];
+            auto* mine = reinterpret_cast<uint4*>(stage + lane*(CHUNK + 8));
+            #pragma unroll
+            for (uint32_t i=0; i < 4; ++i)
+                mine[i] = make_uint4(pack2(v[i*8 + 0], v[i*8 + 1]), pack2(v[i*8 + 2], v[i*8 + 3]),
+                                     pack2(v[i*8 + 4], v[i*8 + 5]), pack2(v[i*8 + 6], v[i*8 + 7]));
+            __syncwarp();
+            #pragma unroll
+            for (uint32_t it=0; it < 4; ++it) {
+                const uint32_t r = it*8 + (lane >> 2), piece = lane & 3;
+                nv_bfloat16* dst = row_ptr(r);
+                if (dst != nullptr)
+                    reinterpret_cast<uint4*>(dst)[piece] = reinterpret_cast<const uint4*>(stage + r*(CHUNK + 8))[piece];
+            }
+            __syncwarp();
+        };
         const auto store_row_f32 = [](float* dst, const float* v) {
             auto* dst4 = reinterpret_cast<float4*>(dst);
             #pragma unroll
             for (uint32_t i=0; i < 8; ++i)
                 dst4[i] = make_float4(v[i*4], v[i*4 + 1], v[i*4 + 2], v[i*4 + 3]);
         };
-        const auto load_row_f32 = [](const float* src, float* v) {
-            const auto* src4 = reinterpret_cast<const float4*>(src);
+        const auto load_row_bf16 = [](const nv_bfloat16* src, float* v) {
+            const auto* src4 = reinterpret_cast<const uint4*>(src);
             #pragma unroll
-            for (uint32_t i=0; i < 8; ++i) {
-                const float4 q = __ldcg(src4 + i);
-                v[i*4] = q.x, v[i*4 + 1] = q.y, v[i*4 + 2] = q.z, v[i*4 + 3] = q.w;
+            for (uint32_t i=0; i < 4; ++i) {
+                const uint4 q = __ldcg(src4 + i);
+                const auto* h = reinterpret_cast<const nv_bfloat162*>(&q);
+                #pragma unroll
+                for (uint32_t j=0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(h[j]);
+                    v[i*8 + j*2] = f.x, v[i*8 + j*2 + 1] = f.y;
+                }
             }
         };
         const auto clamp_gate = [](float g) {
@@ -840,25 +946,27 @@ sm100_bf16_mega_moe_backward_impl(
         };
 
         for (;;) {
-            smem.slot_full[slot].wait(slot_phase);
+            DG_PROF_TIME(p_slotw, smem.slot_full[slot].wait(slot_phase));
             if (!smem.item_valid[slot]) break;
             const auto item = smem.item[slot];
+            DG_PROF(prof_kind = item.kind; const long long prof_t_item = clock64();)
             const bool is_shared = item.expert >= kNumExpertsPerRank;
             if (item.kind == kKindZ) {
                 uint32_t accum;
                 begin_task(accum);
                 auto* z_slot = z_slot_ptr(item.zslot, item.pass);
                 const uint32_t pool_row = item.pool_begin + item.pass*bw.shared_region_stride;
-                const uint32_t prow = item.tile*UMMA_M + row;
-                const bool is_gate = (prow % (2*kGran)) < kGran;
-                const uint32_t j = (prow / (2*kGran))*kGran + (prow % kGran);
+                DG_PROF_SEG_BEGIN();
                 #pragma unroll
                 for (uint32_t c=0; c < kNumChunks; ++c) {
                     float z[CHUNK];
                     load_cols(accum, c*CHUNK, z);
                     if (c == kNumChunks - 1)
                         release_tmem(accum);
-                    store_row_f32(z_slot + static_cast<uint64_t>(prow)*BLOCK_M + c*CHUNK, z);
+                    DG_PROF_SEG(0, 0);
+                    const uint32_t prow0 = item.tile*UMMA_M + epi_warp*32;
+                    stage_store(z, [&](const uint32_t& r) { return z_slot + static_cast<uint64_t>(prow0 + r)*BLOCK_M + c*CHUNK; });
+                    DG_PROF_SEG(0, 1);
                     float hw[CHUNK];
                     #pragma unroll
                     for (uint32_t t = 0; t < CHUNK; ++t) {
@@ -867,8 +975,13 @@ sm100_bf16_mega_moe_backward_impl(
                         const float u = clamp_up(partner);
                         hw[t] = g*sigmoid<kFastMath>(g)*u*smem.route_weight[slot][c*CHUNK + t];
                     }
-                    if (is_gate)
-                        store_row_bf16(hw_pool + static_cast<uint64_t>(j)*pool_stride + pool_row + c*CHUNK, hw);
+                    stage_store(hw, [&](const uint32_t& r) -> nv_bfloat16* {
+                        const uint32_t pr = prow0 + r;
+                        if ((pr % (2*kGran)) >= kGran)
+                            return nullptr;
+                        return hw_pool + static_cast<uint64_t>((pr / (2*kGran))*kGran + (pr % kGran))*pool_stride + pool_row + c*CHUNK;
+                    });
+                    DG_PROF_SEG(0, 2);
                 }
                 fence_proxy_async_global();
                 epi_sync();
@@ -877,6 +990,7 @@ sm100_bf16_mega_moe_backward_impl(
                     ptx::atomic_add_rel(bw.block_a1_done + item.block, 1u);
                     smem.slot_empty[slot].arrive();
                 }
+                DG_PROF_SEG(0, 3);
             } else if (item.kind == kKindDz) {
                 uint32_t accum;
                 begin_task(accum);
@@ -884,15 +998,17 @@ sm100_bf16_mega_moe_backward_impl(
                 const uint32_t pool_row = item.pool_begin + item.pass*bw.shared_region_stride;
                 const uint32_t i = item.tile*UMMA_M + row;
                 const uint32_t pgi = pg(i);
+                DG_PROF_SEG_BEGIN();
                 #pragma unroll
                 for (uint32_t c=0; c < kNumChunks; ++c) {
                     float dh[CHUNK];
                     load_cols(accum, c*CHUNK, dh);
                     if (c == kNumChunks - 1)
                         release_tmem(accum);
+                    DG_PROF_SEG(1, 0);
                     float g[CHUNK], u[CHUNK];
-                    load_row_f32(z_slot + static_cast<uint64_t>(pgi)*BLOCK_M + c*CHUNK, g);
-                    load_row_f32(z_slot + static_cast<uint64_t>(pgi + kGran)*BLOCK_M + c*CHUNK, u);
+                    load_row_bf16(z_slot + static_cast<uint64_t>(pgi)*BLOCK_M + c*CHUNK, g);
+                    load_row_bf16(z_slot + static_cast<uint64_t>(pgi + kGran)*BLOCK_M + c*CHUNK, u);
                     float partial[CHUNK], dz_gate[CHUNK], dz_up[CHUNK];
                     #pragma unroll
                     for (uint32_t t = 0; t < CHUNK; ++t) {
@@ -910,20 +1026,25 @@ sm100_bf16_mega_moe_backward_impl(
                         dz_gate[t] = gate_active ? dhw*uc*dsilu : 0.0f;
                         dz_up[t] = up_active ? dhw*silu : 0.0f;
                     }
-                    store_row_bf16(dz_pool + static_cast<uint64_t>(pgi)*pool_stride + pool_row + c*CHUNK, dz_gate);
-                    store_row_bf16(dz_pool + static_cast<uint64_t>(pgi + kGran)*pool_stride + pool_row + c*CHUNK, dz_up);
+                    const uint32_t i0 = item.tile*UMMA_M + epi_warp*32;
+                    stage_store(dz_gate, [&](const uint32_t& r) { return dz_pool + static_cast<uint64_t>(pg(i0 + r))*pool_stride + pool_row + c*CHUNK; });
+                    stage_store(dz_up, [&](const uint32_t& r) { return dz_pool + static_cast<uint64_t>(pg(i0 + r) + kGran)*pool_stride + pool_row + c*CHUNK; });
+                    DG_PROF_SEG(1, 1);
                     #pragma unroll
-                    for (uint32_t t = 0; t < CHUNK; ++t) {
+                    for (uint32_t step = 0; step < 5; ++step) {
+                        const uint32_t off = 16u >> step;
+                        const bool upper = (lane & off) != 0;
                         #pragma unroll
-                        for (uint32_t off = 16; off > 0; off >>= 1)
-                            partial[t] += __shfl_xor_sync(0xffffffff, partial[t], off);
+                        for (uint32_t t = 0; t < off; ++t) {
+                            const float send = upper ? partial[t] : partial[t + off];
+                            const float keep = upper ? partial[t + off] : partial[t];
+                            partial[t] = keep + __shfl_xor_sync(0xffffffff, send, off);
+                        }
                     }
-                    float mine = partial[0];
-                    #pragma unroll
-                    for (uint32_t t = 1; t < CHUNK; ++t)
-                        mine = lane == t ? partial[t] : mine;
+                    const float mine = partial[0];
                     if (!is_shared)
                         atomicAdd(bw.block_dtopk + static_cast<uint64_t>(item.block)*BLOCK_M + c*CHUNK + lane, mine);
+                    DG_PROF_SEG(1, 2);
                 }
                 fence_proxy_async_global();
                 epi_sync();
@@ -933,62 +1054,58 @@ sm100_bf16_mega_moe_backward_impl(
                     ptx::atomic_add_rel(bw.expert_done + (is_shared ? kNumExpertsPerRank : item.expert), 1u);
                     smem.slot_empty[slot].arrive();
                 }
+                DG_PROF_SEG(1, 3);
             } else if (item.kind == kKindDx) {
                 uint32_t accum;
                 begin_task(accum);
-                auto* stage = &smem.dx_stage[epi_warp][0][0];
+                DG_PROF_SEG_BEGIN();
                 #pragma unroll
-                for (uint32_t c=0; c < kNumChunks; ++c) {
+                for (uint32_t c=0; c < kNumChunksWide; ++c) {
                     float v[CHUNK];
                     load_cols(accum, c*CHUNK, v);
-                    if (c == kNumChunks - 1)
+                    if (c == kNumChunksWide - 1)
                         release_tmem(accum);
-                    #pragma unroll
-                    for (uint32_t t = 0; t < CHUNK; ++t)
-                        stage[t*kDxStageStride + lane] = static_cast<bf16_t>(v[t]);
-                    __syncwarp();
-                    const uint32_t tok = c*CHUNK + lane;
-                    if (tok < item.valid_m) {
-                        const auto* src4 = reinterpret_cast<const uint4*>(stage + lane*kDxStageStride);
-                        auto* remote_dx = reinterpret_cast<uint4*>(sym_buffer.map(
-                            bw.dx_slot_buffer.get_rank_buffer(smem.src_topk[slot][tok])
-                                .get_data_buffer(smem.src_token[slot][tok]).template get_base_ptr<nv_bfloat16>(),
-                            smem.src_rank[slot][tok]) + item.tile*UMMA_M + epi_warp*CHUNK);
-                        #pragma unroll
-                        for (uint32_t q = 0; q < CHUNK / 8; ++q)
-                            remote_dx[q] = src4[q];
-                    }
-                    __syncwarp();
+                    stage_store(v, [&](const uint32_t& r) -> nv_bfloat16* {
+                        const uint32_t t = epi_warp*32 + r;
+                        if (t >= item.valid_m)
+                            return nullptr;
+                        return sym_buffer.map(bw.dx_slot_buffer.get_rank_buffer(meta_topk(slot, t))
+                                                  .get_data_buffer(meta_token(slot, t)).template get_base_ptr<nv_bfloat16>(),
+                                              meta_rank(slot, t)) + item.tile*UMMA_N_WIDE + c*CHUNK;
+                    });
                 }
+                DG_PROF_SEG(2, 0);
                 if (item.tile == 0 && !is_shared && epi_tid < item.valid_m) {
                     auto* remote_dw = sym_buffer.map(
-                        bw.dtopk_weight_slot_buffer.get_rank_buffer(smem.src_topk[slot][epi_tid])
-                            .get_data_buffer(smem.src_token[slot][epi_tid]).template get_base_ptr<float>(),
-                        smem.src_rank[slot][epi_tid]);
+                        bw.dtopk_weight_slot_buffer.get_rank_buffer(meta_topk(slot, epi_tid))
+                            .get_data_buffer(meta_token(slot, epi_tid)).template get_base_ptr<float>(),
+                        meta_rank(slot, epi_tid));
                     *remote_dw = __ldcg(bw.block_dtopk + static_cast<uint64_t>(item.block)*BLOCK_M + epi_tid);
                 }
+                DG_PROF_SEG(2, 1);
                 finish_item(slot);
+                DG_PROF_SEG(2, 2);
             } else {
                 const bool is_dw2 = item.tile < kNumDW2Tiles;
-                const uint32_t mt = is_dw2 ? item.tile / kNumG2Tiles : (item.tile - kNumDW2Tiles) / kNumHTiles;
-                const uint32_t nt = is_dw2 ? item.tile % kNumG2Tiles : (item.tile - kNumDW2Tiles) % kNumHTiles;
+                const uint32_t mt = is_dw2 ? item.tile / kNumG2TilesWide : (item.tile - kNumDW2Tiles) / kNumHTilesWide;
+                const uint32_t nt = is_dw2 ? item.tile % kNumG2TilesWide : (item.tile - kNumDW2Tiles) % kNumHTilesWide;
                 const uint32_t p = is_shared ? item.expert - kNumExpertsPerRank : 0u;
                 const uint32_t m = mt*UMMA_M + row;
                 const uint32_t m1 = kDwNatural ? (m / (2*kGran))*kGran + (m % kGran) + ((m % (2*kGran)) >= kGran ? kIntermediateHidden : 0u) : m;
                 dw_t* dst;
                 if (is_dw2) {
                     dst = is_shared
-                        ? shared_dw2_weights + static_cast<uint64_t>(m)*(kIntermediateHidden*kNumPasses) + p*kIntermediateHidden + nt*UMMA_N
-                        : dw2_weights + (static_cast<uint64_t>(item.expert)*kHidden + m)*kIntermediateHidden + nt*UMMA_N;
+                        ? shared_dw2_weights + static_cast<uint64_t>(m)*(kIntermediateHidden*kNumPasses) + p*kIntermediateHidden + nt*UMMA_N_WIDE
+                        : dw2_weights + (static_cast<uint64_t>(item.expert)*kHidden + m)*kIntermediateHidden + nt*UMMA_N_WIDE;
                 } else {
                     dst = is_shared
-                        ? shared_dw1_weights + (static_cast<uint64_t>(p)*I2 + m1)*kHidden + nt*UMMA_N
-                        : dw1_weights + (static_cast<uint64_t>(item.expert)*I2 + m1)*kHidden + nt*UMMA_N;
+                        ? shared_dw1_weights + (static_cast<uint64_t>(p)*I2 + m1)*kHidden + nt*UMMA_N_WIDE
+                        : dw1_weights + (static_cast<uint64_t>(item.expert)*I2 + m1)*kHidden + nt*UMMA_N_WIDE;
                 }
                 uint32_t accum;
                 begin_task(accum);
                 #pragma unroll
-                for (uint32_t c=0; c < kNumChunks; ++c) {
+                for (uint32_t c=0; c < kNumChunksWide; ++c) {
                     float v[CHUNK];
                     if (item.num_k_blocks == 0) {
                         #pragma unroll
@@ -997,7 +1114,7 @@ sm100_bf16_mega_moe_backward_impl(
                     } else {
                         load_cols(accum, c*CHUNK, v);
                     }
-                    if (c == kNumChunks - 1)
+                    if (c == kNumChunksWide - 1)
                         release_tmem(accum);
                     if constexpr (cute::is_same_v<dw_t, float>)
                         store_row_f32(dst + c*CHUNK, v);
@@ -1006,14 +1123,26 @@ sm100_bf16_mega_moe_backward_impl(
                 }
                 finish_item(slot);
             }
-            slot ^= 1;
-            slot_phase ^= (slot == 0);
+            DG_PROF(p_item[prof_kind] += clock64() - prof_t_item;)
+            slot = (slot + 1) % kNumSlots;
+            slot_phase^=(slot == 0);
         }
+        DG_PROF(if (prof_print && epi_tid == 0)
+            printf("DGPROF r=%u sm=%u role=epi total=%lld item_z=%llu item_dz=%llu item_dx=%llu item_dw=%llu tfull_z=%llu tfull_dz=%llu tfull_dx=%llu tfull_dw=%llu slot_wait=%llu\n",
+                   prof_rank, sm_idx, clock64() - prof_t_main, p_item[kKindZ], p_item[kKindDz], p_item[kKindDx], p_item[kKindDw],
+                   p_tfull[kKindZ], p_tfull[kKindDz], p_tfull[kKindDx], p_tfull[kKindDw], p_slotw);
+            if (prof_print && epi_tid == 0)
+            printf("DGPROF r=%u sm=%u role=episeg z_tmem=%llu z_zst=%llu z_hw=%llu z_tail=%llu dz_tmem=%llu dz_math=%llu dz_dtopk=%llu dz_tail=%llu dx_store=%llu dx_dtopk=%llu dx_tail=%llu\n",
+                   prof_rank, sm_idx, p_seg[0][0], p_seg[0][1], p_seg[0][2], p_seg[0][3], p_seg[1][0], p_seg[1][1], p_seg[1][2], p_seg[1][3],
+                   p_seg[2][0], p_seg[2][1], p_seg[2][2]);)
     }
 
+    DG_PROF(const long long prof_t_roles_end = clock64();)
     __threadfence_system();
     comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, 199>(
         workspace, sym_buffer, sm_idx, tid, [&]() { __syncthreads(); });
+    DG_PROF(const long long prof_t_barrier_end = clock64();
+            if (sm_idx == 0 && tid == 0) g_dg_mega_bwd_prof_launch = prof_launch + 1;)
     if (warp == 0)
         cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
 
@@ -1063,6 +1192,10 @@ sm100_bf16_mega_moe_backward_impl(
         dtopk_weights[linear] = e < 0 ? 0.0f : *bw.dtopk_weight_slot_buffer.get_rank_buffer(topk)
             .get_data_buffer(token).template get_base_ptr<float>();
     }
+    DG_PROF(if (prof_print && tid == 0)
+        printf("DGPROF r=%u sm=%u role=phase prologue=%lld main=%lld final_barrier=%lld tail=%lld total=%lld\n",
+               prof_rank, sm_idx, prof_t_main - prof_t_start, prof_t_roles_end - prof_t_main,
+               prof_t_barrier_end - prof_t_roles_end, clock64() - prof_t_barrier_end, clock64() - prof_t_start);)
 #else
     if (blockIdx.x == 0 && threadIdx.x == 0)
         DG_DEVICE_ASSERT(false && "This kernel only support sm_100f");
