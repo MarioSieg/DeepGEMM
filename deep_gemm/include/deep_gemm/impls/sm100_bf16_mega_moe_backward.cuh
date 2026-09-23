@@ -708,7 +708,6 @@ sm100_bf16_mega_moe_backward_impl(
                     SUPERMEOW_PROF_TIME(p_empty, smem.empty[stage].wait(phase ^ 1));
                     if (cute::elect_one_sync()) {
                         if (is_dw2) {
-                            tma::copy<UMMA_M, BLOCK_K, 128, bf16_t>(&tensor_map_dy_mn, &smem.full[stage], smem.a[stage], mt*UMMA_M, item.x_begin + kb*BLOCK_K);
                             #pragma unroll
                             for (uint32_t h = 0; h < 2; ++h)
                                 tma::copy<UMMA_M, BLOCK_K, 128, bf16_t>(&tensor_map_dy_mn, &smem.full[stage], smem.a[stage] + h*kAHalf,
@@ -718,7 +717,6 @@ sm100_bf16_mega_moe_backward_impl(
                                 tma::copy<BLOCK_K, UMMA_N, 128, bf16_t>(&tensor_map_hw_k, &smem.full[stage], smem.b[stage] + h*kBHalf,
                                                                         item.pool_begin + kb*BLOCK_K, nt*UMMA_N_WIDE + h*UMMA_N);
                         } else {
-                            tma::copy<BLOCK_K, UMMA_M, 128, bf16_t>(&tensor_map_dz_k, &smem.full[stage], smem.a[stage], item.pool_begin + kb*BLOCK_K, mt*UMMA_M);
                             #pragma unroll
                             for (uint32_t h = 0; h < 2; ++h)
                                 tma::copy<BLOCK_K, UMMA_M, 128, bf16_t>(&tensor_map_dz_k, &smem.full[stage], smem.a[stage] + h*kAHalf,
@@ -728,7 +726,6 @@ sm100_bf16_mega_moe_backward_impl(
                                 tma::copy<UMMA_N, BLOCK_K, 128, bf16_t>(&tensor_map_x_mn, &smem.full[stage], smem.b[stage] + h*kBHalf,
                                                                         nt*UMMA_N_WIDE + h*UMMA_N, item.x_begin + kb*BLOCK_K);
                         }
-                        issue(kStageBytesWide);
                         issue(kStageBytesDw);
                     } else {
                         advance();
