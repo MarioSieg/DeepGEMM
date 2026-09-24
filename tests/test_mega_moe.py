@@ -169,6 +169,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         transformed_l1_weights, transformed_l2_weights = (
             deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+        if args.l1_natural:
+            assert is_bf16xbf16 and num_shared_experts == 0, 'Natural L1 weights need bf16xbf16 and no shared experts'
+            transformed_l1_weights = l1_weights
         if num_shared_experts > 0:
             transformed_shared_l1_weights, transformed_shared_l2_weights = (
                 deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))
@@ -199,6 +202,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
+        if args.l1_natural:
+            kernel_kwargs.update(l1_natural_layout=True)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -435,6 +440,7 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
+    parser.add_argument('--l1-natural', type=int, default=0, help='Pass bf16 L1 weights in the untransformed [gate; up] layout (requires --num-shared-experts 0)')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
