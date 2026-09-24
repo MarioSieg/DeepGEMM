@@ -88,12 +88,13 @@ def _test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         shared_l1_weights = shared_l2_weights = None
 
     if args.l1_natural:
-        assert not has_shared, 'Natural L1 weights do not support shared experts'
         transformed_l1_weights, transformed_l2_weights = l1_weights, l2_weights
     else:
         transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(
             l1_weights, l2_weights)
-    if has_shared:
+    if has_shared and args.l1_natural:
+        transformed_shared_l1_weights, transformed_shared_l2_weights = shared_l1_weights, shared_l2_weights
+    elif has_shared:
         transformed_shared_l1_weights, transformed_shared_l2_weights = deep_gemm.transform_weights_for_mega_moe(
             shared_l1_weights, shared_l2_weights)
     else:
@@ -217,7 +218,7 @@ if __name__ == '__main__':
     parser.add_argument('--fast-math', type=int, default=0, help='Enable fast math (0 or 1); 0 for a tight check')
     parser.add_argument('--tolerance', type=float, default=1e-3, help='Max allowed `calc_diff` (global relative error)')
     parser.add_argument('--natural-bf16', type=int, default=0, help='Write dW in bf16 and the untransformed [gate; up] layout')
-    parser.add_argument('--l1-natural', type=int, default=0, help='Pass L1 weights in the untransformed [gate; up] layout (requires --num-shared-experts 0)')
+    parser.add_argument('--l1-natural', type=int, default=0, help='Pass L1 weights in the untransformed [gate; up] layout')
     args = parser.parse_args()
 
     torch.multiprocessing.spawn(_test, args=(args.num_processes, args), nprocs=args.num_processes)

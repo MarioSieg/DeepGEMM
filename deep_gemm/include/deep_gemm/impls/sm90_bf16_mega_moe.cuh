@@ -123,7 +123,6 @@ sm90_bf16_mega_moe_impl(void* y,
     constexpr uint32_t kNumAccum = BLOCK_M / 2;
     DG_STATIC_ASSERT(BLOCK_N == WGMMA_M * kNumMathWarpgroups, "Invalid block N");
     DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
-    DG_STATIC_ASSERT(not (kL1Natural and kHasShared), "Natural L1 weights do not support shared experts");
     DG_STATIC_ASSERT(BLOCK_K == 64, "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0 and BLOCK_M <= 256, "Invalid block M");
     DG_STATIC_ASSERT(STORE_BLOCK_M % 16 == 0 and BLOCK_M % STORE_BLOCK_M == 0, "Invalid store block M");
@@ -545,6 +544,10 @@ sm90_bf16_mega_moe_impl(void* y,
                 if (cute::elect_one_sync()) {
                     if (kL1Natural and task_info.block_phase == sched::BlockPhase::Linear1) {
                         tma::copy_gate_up_natural<BLOCK_K, BLOCK_N, kSwizzleBMode, L1_SHAPE_N, b_dtype_t>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx);
+                    } else if (kL1Natural and task_info.block_phase == sched::BlockPhase::SharedLinear1) {
+                        // All shared experts form one `[gate | up]` matrix of `L1_SHAPE_N * kNumSharedExperts` rows
+                        tma::copy_gate_up_natural<BLOCK_K, BLOCK_N, kSwizzleBMode, L1_SHAPE_N * (kHasShared ? kNumSharedExperts : 1), b_dtype_t>(
                             tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx);
                     } else {
                         tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, b_dtype_t>(

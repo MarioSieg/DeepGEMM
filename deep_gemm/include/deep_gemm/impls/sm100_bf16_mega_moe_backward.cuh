@@ -112,7 +112,6 @@ sm100_bf16_mega_moe_backward_impl(
     static_assert(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     static_assert(kHidden % UMMA_M == 0 && kIntermediateHidden % UMMA_M == 0, "Invalid hidden sizes");
     static_assert(kIntermediateHidden % kGran == 0, "Invalid intermediate hidden for gate/up interleaving");
-    static_assert(!(kL1Natural && kHasShared), "Natural L1 weights do not support shared experts");
     static_assert(kNumTopk <= 32, "Invalid number of topk");
     static_assert(kNumSMs > 1, "Invalid SM count");
     static_assert(BLOCK_M == UMMA_N && BLOCK_M % BLOCK_K == 0 && BLOCK_M % 4 == 0 && BLOCK_M <= kNumEpilogueThreads, "Invalid token block");
@@ -635,9 +634,13 @@ sm100_bf16_mega_moe_backward_impl(
                 for (uint32_t kb = 0; kb < kNumKBlocksH; ++kb) {
                     smem.empty[stage].wait(phase ^ 1);
                     if (cute::elect_one_sync()) {
-                        if constexpr (kL1Natural)
-                            tma::copy_gate_up_natural<BLOCK_K, UMMA_M, 128, I2, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb*BLOCK_K, w1_rows + item.tile*UMMA_M);
-                        else
+                        if constexpr (kL1Natural) {
+                            // All shared experts form one `[gate | up]` matrix of `I2 * kNumPasses` rows
+                            if (is_shared)
+                                tma::copy_gate_up_natural<BLOCK_K, UMMA_M, 128, I2 * kNumPasses, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb*BLOCK_K, w1_rows + item.tile*UMMA_M);
+                            else
+                                tma::copy_gate_up_natural<BLOCK_K, UMMA_M, 128, I2, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb*BLOCK_K, w1_rows + item.tile*UMMA_M);
+                        } else
                             tma::copy<BLOCK_K, UMMA_M, 128, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb*BLOCK_K, w1_rows + item.tile*UMMA_M);
                         tma::copy<BLOCK_K, UMMA_N, 128, bf16_t>(&tensor_map_x_k, &smem.full[stage], smem.b[stage], kb*BLOCK_K, item.pool_begin);
                         issue(kStageBytes);
@@ -665,9 +668,13 @@ sm100_bf16_mega_moe_backward_impl(
                 for (uint32_t kb = 0; kb < item.num_k_blocks; ++kb) {
                     smem.empty[stage].wait(phase ^ 1);
                     if (cute::elect_one_sync()) {
-                        if constexpr (kL1Natural)
-                            tma::copy_gate_up_natural<UMMA_M, BLOCK_K, 128, I2, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile*UMMA_M, w1_rows + kb*BLOCK_K);
-                        else
+                        if constexpr (kL1Natural) {
+                            // All shared experts form one `[gate | up]` matrix of `I2 * kNumPasses` rows
+                            if (is_shared)
+                                tma::copy_gate_up_natural<UMMA_M, BLOCK_K, 128, I2 * kNumPasses, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile*UMMA_M, w1_rows + kb*BLOCK_K);
+                            else
+                                tma::copy_gate_up_natural<UMMA_M, BLOCK_K, 128, I2, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile*UMMA_M, w1_rows + kb*BLOCK_K);
+                        } else
                             tma::copy<UMMA_M, BLOCK_K, 128, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile*UMMA_M, w1_rows + kb*BLOCK_K);
                         tma::copy<UMMA_N, BLOCK_K, 128, bf16_t>(&tensor_map_dz_mn, &smem.full[stage], smem.b[stage],
                                                                 item.pool_begin + (kb / kNumKBlocksI2)*bw.shared_region_stride, (kb % kNumKBlocksI2)*BLOCK_K);
@@ -982,7 +989,11 @@ sm100_bf16_mega_moe_backward_impl(
                 const uint32_t nt = is_dw2 ? item.tile % kNumG2Tiles : (item.tile - kNumDW2Tiles) % kNumHTiles;
                 const uint32_t p = is_shared ? item.expert - kNumExpertsPerRank : 0u;
                 const uint32_t m = mt*UMMA_M + row;
-                const uint32_t m1 = kDwNatural ? (m / (2*kGran))*kGran + (m % kGran) + ((m % (2*kGran)) >= kGran ? kIntermediateHidden : 0u) : m;
+                // Natural dW1 rows are `[gate | up]`; all shared experts form one matrix of `kIntermediateHidden * kNumPasses` gate rows
+                const uint32_t m_half = (m / (2*kGran))*kGran + (m % kGran);
+                const bool m_is_up = (m % (2*kGran)) >= kGran;
+                const uint32_t m1 = kDwNatural ? m_half + (m_is_up ? kIntermediateHidden : 0u) : m;
+                const uint32_t shared_m1 = kDwNatural ? p*kIntermediateHidden + m_half + (m_is_up ? kIntermediateHidden*kNumPasses : 0u) : p*I2 + m;
                 dw_t* dst;
                 if (is_dw2) {
                     dst = is_shared
@@ -990,7 +1001,7 @@ sm100_bf16_mega_moe_backward_impl(
                         : dw2_weights + (static_cast<uint64_t>(item.expert)*kHidden + m)*kIntermediateHidden + nt*UMMA_N;
                 } else {
                     dst = is_shared
-                        ? shared_dw1_weights + (static_cast<uint64_t>(p)*I2 + m1)*kHidden + nt*UMMA_N
+                        ? shared_dw1_weights + static_cast<uint64_t>(shared_m1)*kHidden + nt*UMMA_N
                         : dw1_weights + (static_cast<uint64_t>(item.expert)*I2 + m1)*kHidden + nt*UMMA_N;
                 }
                 uint32_t accum;

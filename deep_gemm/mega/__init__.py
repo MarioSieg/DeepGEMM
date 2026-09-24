@@ -202,8 +202,8 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation_clamp: Optional[float] = None,
                   fast_math: bool = True,
                   l1_natural_layout: bool = False):
-    # `l1_natural_layout`: `l1_weights` is `[gate | up]` per expert instead of
-    # `transform_weights_for_mega_moe`'s interleaved layout (no shared experts)
+    # `l1_natural_layout`: `l1_weights` (and `shared_l1_weights`) are `[gate | up]` instead of
+    # `transform_weights_for_mega_moe`'s interleaved layout
     _C.bf16_mega_moe(
         y,
         l1_weights,

@@ -52,7 +52,6 @@ static void sm90_bf16_mega_moe(
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
-    DG_HOST_ASSERT(not l1_natural_layout or num_shared_experts == 0);
     const auto tensor_map_l1_weights = l1_natural_layout ?
         make_tma_gate_up_natural_desc(l1_weights,
                                       hidden, intermediate_hidden, num_experts_per_rank,
@@ -84,12 +83,16 @@ static void sm90_bf16_mega_moe(
         config.block_k, config.load_block_m,
         static_cast<int>(shared_l1_acts.stride(-2)),
         config.swizzle_acts_mode) : tensor_map_l1_acts;
-    const auto tensor_map_shared_l1_weights = num_shared_experts > 0 ? make_tma_2d_desc(
-        shared_l1_weights,
-        hidden, shared_intermediate_hidden * 2,
-        config.block_k, config.load_block_n,
-        static_cast<int>(shared_l1_weights.stride(-2)),
-        config.swizzle_weights_mode) : tensor_map_l1_weights;
+    const auto tensor_map_shared_l1_weights = num_shared_experts == 0 ? tensor_map_l1_weights :
+        l1_natural_layout ?
+        make_tma_gate_up_natural_desc(shared_l1_weights,
+                                      hidden, shared_intermediate_hidden, 1,
+                                      config.load_block_n, config.swizzle_weights_mode) :
+        make_tma_2d_desc(shared_l1_weights,
+                         hidden, shared_intermediate_hidden * 2,
+                         config.block_k, config.load_block_n,
+                         static_cast<int>(shared_l1_weights.stride(-2)),
+                         config.swizzle_weights_mode);
     const auto tensor_map_shared_l1_output = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
         shared_intermediate_hidden, num_max_tokens_per_rank,
