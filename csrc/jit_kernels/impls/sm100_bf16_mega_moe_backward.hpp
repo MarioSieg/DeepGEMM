@@ -29,7 +29,8 @@ static void sm100_bf16_mega_moe_backward(
     const int& num_ring_tokens,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& dw_natural_layout
+    const bool& dw_natural_layout,
+    const bool& l1_natural_layout
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -58,8 +59,13 @@ static void sm100_bf16_mega_moe_backward(
     const auto dz_pool = view(bwd_buffer.dz_pool, 2 * intermediate_hidden, num_pool_rows);
     const auto hw_pool = view(bwd_buffer.hw_pool, intermediate_hidden, num_pool_rows);
 
-    const auto tensor_map_w1_k = make_tma_2d_desc(w1_weights, hidden, num_experts_per_rank * 2 * intermediate_hidden, 64, 128, hidden, 128);
-    const auto tensor_map_w1_mn = make_tma_2d_desc(w1_weights, hidden, num_experts_per_rank * 2 * intermediate_hidden, 64, 64, hidden, 128);
+    DG_HOST_ASSERT(not l1_natural_layout or num_shared_experts == 0);
+    const auto tensor_map_w1_k = l1_natural_layout ?
+        make_tma_gate_up_natural_desc(w1_weights, hidden, intermediate_hidden, num_experts_per_rank, 128, 128) :
+        make_tma_2d_desc(w1_weights, hidden, num_experts_per_rank * 2 * intermediate_hidden, 64, 128, hidden, 128);
+    const auto tensor_map_w1_mn = l1_natural_layout ?
+        make_tma_gate_up_natural_desc(w1_weights, hidden, intermediate_hidden, num_experts_per_rank, 64, 128) :
+        make_tma_2d_desc(w1_weights, hidden, num_experts_per_rank * 2 * intermediate_hidden, 64, 64, hidden, 128);
     const auto tensor_map_w2_mn = make_tma_2d_desc(w2_weights, intermediate_hidden, num_experts_per_rank * hidden, 64, 64, intermediate_hidden, 128);
     const auto tensor_map_shared_w1_k = num_shared_experts > 0 ?
         make_tma_2d_desc(*shared_w1_weights, hidden, num_shared_experts * 2 * intermediate_hidden, 64, 128, hidden, 128) : tensor_map_w1_k;
@@ -98,7 +104,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}, {}
+        {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -110,7 +116,8 @@ static void __instantiate_kernel() {{
         to_string(activation_clamp),
         fast_math ? "true" : "false",
         config.num_stages,
-        dw_type, dw_natural_layout ? "true" : "false"));
+        dw_type, dw_natural_layout ? "true" : "false",
+        l1_natural_layout ? "true" : "false"));
     jit->launch(
         kernel, {
             .num_smem_bytes = config.smem_size,

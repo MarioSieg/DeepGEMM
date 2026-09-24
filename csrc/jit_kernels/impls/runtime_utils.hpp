@@ -200,6 +200,40 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
     return tensor_map;
 }
 
+// A natural `[num_groups, 2 * n, k]` gate/up weight (`[gate | up]` per group), viewed as
+// `(k, gran, 2, n / gran, num_groups)`: a `(block_k, gran, 2, block_rows / (2 * gran), 1)` box lands
+// in shared memory as `[g0..7, u0..7, g8..15, ...]`, the same tile `transform_weights_for_mega_moe` produces
+static CUtensorMap make_tma_gate_up_natural_desc(const torch::Tensor& t,
+                                                 const int& k, const int& n, const int& num_groups,
+                                                 const int& block_rows, const int& swizzle_mode,
+                                                 const int& gran = 8) {
+    const auto elem_size = static_cast<int>(t.element_size());
+    DG_HOST_ASSERT(t.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(t.is_contiguous() and t.numel() == static_cast<int64_t>(num_groups) * 2 * n * k);
+    DG_HOST_ASSERT(reinterpret_cast<std::uintptr_t>(t.data_ptr()) % 16u == 0u);
+    DG_HOST_ASSERT(swizzle_mode != 0 and n % gran == 0 and block_rows % (2 * gran) == 0);
+    DG_HOST_ASSERT(static_cast<int64_t>(k) * elem_size % 16 == 0);
+
+    const auto row_bytes = static_cast<cuuint64_t>(k) * elem_size;
+    CUtensorMap tensor_map;
+    const cuuint64_t gmem_dims[5] = {static_cast<cuuint64_t>(k), static_cast<cuuint64_t>(gran), 2,
+                                     static_cast<cuuint64_t>(n / gran), static_cast<cuuint64_t>(num_groups)};
+    const cuuint64_t gmem_strides[4] = {row_bytes, row_bytes * n, row_bytes * gran, row_bytes * 2 * n};
+    const cuuint32_t smem_dims[5] = {static_cast<cuuint32_t>(swizzle_mode / elem_size), static_cast<cuuint32_t>(gran), 2,
+                                     static_cast<cuuint32_t>(block_rows / (2 * gran)), 1};
+    const cuuint32_t elem_strides[5] = {1, 1, 1, 1, 1};
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        printf("Making natural gate/up TMA desc: k: %d, n: %d, groups: %d, block rows: %d, swizzle: %d\n",
+               k, n, num_groups, block_rows, swizzle_mode);
+    }
+    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+        &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), false, true),
+        5, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, 0),
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return tensor_map;
+}
+
 static CUtensorMap make_tma_a_desc(const cute::UMMA::Major& major,
                                    const torch::Tensor& t,
                                    const int& shape_m, const int& shape_k,

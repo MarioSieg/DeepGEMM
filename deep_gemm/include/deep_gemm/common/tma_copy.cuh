@@ -97,4 +97,46 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
     }
 }
 
+// Loads `BLOCK_ROWS` interleaved gate/up rows starting at interleaved row `row_idx` of a natural
+// `[num_groups, kShapeN2, k]` weight through a `make_tma_gate_up_natural_desc` descriptor.
+// The shared memory tile matches a 2D `copy` of the same rows from the interleaved weight.
+template <uint32_t BLOCK_INNER, uint32_t BLOCK_ROWS,
+          uint32_t kSwizzleMode, uint32_t kShapeN2,
+          typename dtype_t, uint32_t kGran = 8>
+CUTLASS_DEVICE void
+copy_gate_up_natural(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
+                     dtype_t* smem_ptr, const uint32_t& inner_idx, const uint32_t& row_idx,
+                     const uint32_t& num_tma_multicast = 1) {
+    DG_STATIC_ASSERT(kSwizzleMode != 0, "Natural gate/up loads require swizzling");
+    DG_STATIC_ASSERT(BLOCK_ROWS % (2 * kGran) == 0 and kShapeN2 % BLOCK_ROWS == 0, "Invalid gate/up block rows");
+    constexpr uint32_t kAtom = kSwizzleMode / sizeof(dtype_t);
+    DG_STATIC_ASSERT(BLOCK_INNER % kAtom == 0, "TMA inner block must contain whole atoms");
+
+    const auto group_idx = static_cast<int32_t>(row_idx / kShapeN2);
+    const auto pair_idx = static_cast<int32_t>((row_idx % kShapeN2) / (2 * kGran));
+    if (num_tma_multicast == 1) {
+        #pragma unroll
+        for (uint32_t i = 0; i < BLOCK_INNER / kAtom; ++ i) {
+            cute::SM90_TMA_LOAD_5D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+                                         static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+                                         smem_ptr + i * BLOCK_ROWS * kAtom,
+                                         static_cast<int32_t>(inner_idx + i * kAtom), 0, 0, pair_idx, group_idx);
+        }
+    } else {
+        #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000))
+            // 2-CTA function will send signals to the leader CTA only
+            #pragma unroll
+            for (uint32_t i = 0; i < BLOCK_INNER / kAtom; ++ i) {
+                cute::SM100_TMA_2SM_LOAD_5D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+                                                  static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                                  smem_ptr + i * BLOCK_ROWS * kAtom,
+                                                  static_cast<int32_t>(inner_idx + i * kAtom), 0, 0, pair_idx, group_idx);
+            }
+        #else
+            // Only SM100's 2-CTA loads multicast natural gate/up weights
+            DG_TRAP_ONLY_DEVICE_ASSERT(false);
+        #endif
+    }
+}
+
 } // namespace deep_gemm::tma

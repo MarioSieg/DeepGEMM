@@ -42,6 +42,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kL1Natural,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -122,6 +123,7 @@ sm90_bf16_mega_moe_impl(void* y,
     constexpr uint32_t kNumAccum = BLOCK_M / 2;
     DG_STATIC_ASSERT(BLOCK_N == WGMMA_M * kNumMathWarpgroups, "Invalid block N");
     DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
+    DG_STATIC_ASSERT(not (kL1Natural and kHasShared), "Natural L1 weights do not support shared experts");
     DG_STATIC_ASSERT(BLOCK_K == 64, "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0 and BLOCK_M <= 256, "Invalid block M");
     DG_STATIC_ASSERT(STORE_BLOCK_M % 16 == 0 and BLOCK_M % STORE_BLOCK_M == 0, "Invalid store block M");
@@ -541,8 +543,13 @@ sm90_bf16_mega_moe_impl(void* y,
                 const uint32_t n_idx = task_info.is_shared() ? n_block_idx * BLOCK_N : task_info.local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                        tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 1);
+                    if (kL1Natural and task_info.block_phase == sched::BlockPhase::Linear1) {
+                        tma::copy_gate_up_natural<BLOCK_K, BLOCK_N, kSwizzleBMode, L1_SHAPE_N, b_dtype_t>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx);
+                    } else {
+                        tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, b_dtype_t>(
+                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 1);
+                    }
                     shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]));
                 }
                 __syncwarp();

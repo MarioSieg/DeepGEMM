@@ -56,6 +56,7 @@ template <
     uint32_t kNumStages,
     typename dw_t,
     bool kDwNatural,
+    bool kL1Natural,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
     uint32_t kNumPasses = kHasShared ? kNumSharedExperts : 1,
@@ -139,6 +140,7 @@ sm90_bf16_mega_moe_backward_impl(
     static_assert(kNumTopk <= 32, "Invalid number of topk");
     static_assert(kNumSMs > 1, "Invalid SM count");
     static_assert(BLOCK_M == MMA_N && BLOCK_M % BLOCK_K == 0 && BLOCK_M == kNumConsumerThreadsPerWG, "Invalid token block");
+    static_assert(!(kL1Natural && kHasShared), "Natural L1 weights do not support shared experts");
     static_assert((31 & kNumVecPerRow) == 0, "Invalid hidden for the gather");
     static_assert(kNumExpertSlots <= layout::MegaMoEBackwardBuffer::kMaxExpertSlots, "Too many experts per rank");
     static_assert(kNumStages >= 2, "Invalid number of stages");
@@ -672,7 +674,10 @@ sm90_bf16_mega_moe_backward_impl(
                 for (uint32_t kb = 0; kb < kNumKBlocksH; ++ kb) {
                     smem.empty[stage].wait(phase ^ 1);
                     if (cute::elect_one_sync()) {
-                        tma::copy<BLOCK_K, MMA_M, kSwizzleMode, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb * BLOCK_K, w1_rows + item.tile * MMA_M);
+                        if constexpr (kL1Natural)
+                            tma::copy_gate_up_natural<BLOCK_K, MMA_M, kSwizzleMode, I2, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb * BLOCK_K, w1_rows + item.tile * MMA_M);
+                        else
+                            tma::copy<BLOCK_K, MMA_M, kSwizzleMode, bf16_t>(w1k, &smem.full[stage], smem.a[stage], kb * BLOCK_K, w1_rows + item.tile * MMA_M);
                         tma::copy<BLOCK_K, MMA_N, kSwizzleMode, bf16_t>(&tensor_map_x_k, &smem.full[stage], smem.b[stage], kb * BLOCK_K, item.pool_begin);
                         issue(kStageBytes);
                     } else {
@@ -699,7 +704,10 @@ sm90_bf16_mega_moe_backward_impl(
                 for (uint32_t kb = 0; kb < item.num_k_blocks; ++ kb) {
                     smem.empty[stage].wait(phase ^ 1);
                     if (cute::elect_one_sync()) {
-                        tma::copy<MMA_M, BLOCK_K, kSwizzleMode, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile * MMA_M, w1_rows + kb * BLOCK_K);
+                        if constexpr (kL1Natural)
+                            tma::copy_gate_up_natural<MMA_M, BLOCK_K, kSwizzleMode, I2, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile * MMA_M, w1_rows + kb * BLOCK_K);
+                        else
+                            tma::copy<MMA_M, BLOCK_K, kSwizzleMode, bf16_t>(w1mn, &smem.full[stage], smem.a[stage], item.tile * MMA_M, w1_rows + kb * BLOCK_K);
                         tma::copy<MMA_N, BLOCK_K, kSwizzleMode, bf16_t>(&tensor_map_dz_mn, &smem.full[stage], smem.b[stage],
                                                                         item.pool_begin + (kb / kNumKBlocksI2) * bw.shared_region_stride, (kb % kNumKBlocksI2) * BLOCK_K);
                         issue(kStageBytes);

@@ -27,7 +27,8 @@ static void sm100_bf16_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& l1_natural_layout
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -46,11 +47,16 @@ static void sm100_bf16_mega_moe(
                                                      config.block_k, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
-    const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights,
-                                                        hidden, num_experts_per_rank * intermediate_hidden * 2,
-                                                        config.block_k, config.load_block_n,
-                                                        static_cast<int>(l1_weights.stride(-2)),
-                                                        config.swizzle_weights_mode);
+    DG_HOST_ASSERT(not l1_natural_layout or num_shared_experts == 0);
+    const auto tensor_map_l1_weights = l1_natural_layout ?
+        make_tma_gate_up_natural_desc(l1_weights,
+                                      hidden, intermediate_hidden, num_experts_per_rank,
+                                      config.load_block_n, config.swizzle_weights_mode) :
+        make_tma_2d_desc(l1_weights,
+                         hidden, num_experts_per_rank * intermediate_hidden * 2,
+                         config.block_k, config.load_block_n,
+                         static_cast<int>(l1_weights.stride(-2)),
+                         config.swizzle_weights_mode);
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_ring_tokens,
                                                        config.block_n / 2, config.store_block_m,
@@ -125,7 +131,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}
+        {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -140,7 +146,8 @@ static void __instantiate_kernel() {{
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
         to_string(activation_clamp),
-        fast_math ? "true" : "false"));
+        fast_math ? "true" : "false",
+        l1_natural_layout ? "true" : "false"));
 
     // Launch
     jit->launch(

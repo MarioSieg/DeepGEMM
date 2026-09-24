@@ -305,7 +305,8 @@ static void bf16_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& l1_natural_layout
 ) {
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
@@ -389,7 +390,7 @@ static void bf16_mega_moe(
                             num_shared_experts,
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
-                            activation_clamp, fast_math);
+                            activation_clamp, fast_math, l1_natural_layout);
     } else if (arch_major == 9) {
         sm90_bf16_mega_moe(y,
                            l1_acts, l2_acts,
@@ -403,7 +404,7 @@ static void bf16_mega_moe(
                            num_shared_experts,
                            num_tokens, num_topk,
                            hidden, intermediate_hidden,
-                           activation_clamp, fast_math);
+                           activation_clamp, fast_math, l1_natural_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -433,7 +434,8 @@ static void bf16_mega_moe_backward(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const bool& dw_natural_layout
+    const bool& dw_natural_layout,
+    const bool& l1_natural_layout
 ) {
     const auto num_tokens = static_cast<int>(dy.size(0));
     DG_HOST_ASSERT(activation == "swiglu");
@@ -547,7 +549,7 @@ static void bf16_mega_moe_backward(
                                      num_tokens, num_topk,
                                      hidden, intermediate_hidden,
                                      num_ring_tokens,
-                                     activation_clamp, fast_math, dw_natural_layout);
+                                     activation_clamp, fast_math, dw_natural_layout, l1_natural_layout);
     } else if (arch_major == 9) {
         sm90_bf16_mega_moe_backward(dx,
                                     dw1_weights, dw2_weights, dtopk_weights,
@@ -561,7 +563,7 @@ static void bf16_mega_moe_backward(
                                     num_tokens, num_topk,
                                     hidden, intermediate_hidden,
                                     num_ring_tokens,
-                                    activation_clamp, fast_math, dw_natural_layout);
+                                    activation_clamp, fast_math, dw_natural_layout, l1_natural_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

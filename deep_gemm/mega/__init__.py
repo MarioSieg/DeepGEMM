@@ -200,7 +200,10 @@ def bf16_mega_moe(y: torch.Tensor,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  l1_natural_layout: bool = False):
+    # `l1_natural_layout`: `l1_weights` is `[gate | up]` per expert instead of
+    # `transform_weights_for_mega_moe`'s interleaved layout (no shared experts)
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -215,7 +218,8 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        l1_natural_layout
     )
 
 
@@ -234,7 +238,8 @@ def bf16_mega_moe_backward(dx: torch.Tensor,
                            activation: str = 'swiglu',
                            activation_clamp: Optional[float] = None,
                            fast_math: bool = True,
-                           dw_natural_layout: bool = False):
+                           dw_natural_layout: bool = False,
+                           l1_natural_layout: bool = False):
     _C.bf16_mega_moe_backward(
         dx,
         dw1_weights, dw2_weights, dtopk_weights,
@@ -250,5 +255,6 @@ def bf16_mega_moe_backward(dx: torch.Tensor,
         sym_buffer.num_topk,
         activation, activation_clamp,
         fast_math,
-        dw_natural_layout
+        dw_natural_layout,
+        l1_natural_layout
     )
